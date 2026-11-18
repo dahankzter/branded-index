@@ -75,14 +75,12 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::fmt;
 use core::hash::Hash;
 use core::iter::FusedIterator;
 use core::marker::PhantomData;
 use core::ops;
-
-#[doc(hidden)]
-pub mod kernels;
 
 /// Invariant lifetime marker. Invariance stops the compiler from shrinking or growing `'id` to
 /// unify two different brands, so each brand stays distinct.
@@ -102,13 +100,19 @@ impl Brand<'_> {
 /// anything carrying it, or store branded values anywhere outside the closure.
 #[inline(always)]
 pub fn with_len<R>(n: usize, f: impl for<'id> FnOnce(Len<'id>) -> R) -> R {
-    f(Len { n, brand: Brand::new() })
+    f(Len {
+        n,
+        brand: Brand::new(),
+    })
 }
 
 /// Brands `slice` and runs `f` with it. Shorthand for [`with_len`] plus [`Len::brand`].
 #[inline(always)]
 pub fn scope<'a, T, R>(slice: &'a [T], f: impl for<'id> FnOnce(Slice<'id, 'a, T>) -> R) -> R {
-    f(Slice { s: slice, brand: Brand::new() })
+    f(Slice {
+        s: slice,
+        brand: Brand::new(),
+    })
 }
 
 /// Mutable counterpart of [`scope`].
@@ -117,7 +121,10 @@ pub fn scope_mut<'a, T, R>(
     slice: &'a mut [T],
     f: impl for<'id> FnOnce(SliceMut<'id, 'a, T>) -> R,
 ) -> R {
-    f(SliceMut { s: slice, brand: Brand::new() })
+    f(SliceMut {
+        s: slice,
+        brand: Brand::new(),
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -147,7 +154,10 @@ impl<'id> Len<'id> {
     /// Validates `i < n`. This is the one bounds check an index ever pays.
     #[inline(always)]
     pub fn check(self, i: usize) -> Option<Index<'id>> {
-        (i < self.n).then_some(Index { raw: i, brand: self.brand })
+        (i < self.n).then_some(Index {
+            raw: i,
+            brand: self.brand,
+        })
     }
 
     /// Like [`check`](Self::check), but keeps a compact representation (for example `u32`), so
@@ -155,7 +165,10 @@ impl<'id> Len<'id> {
     #[inline(always)]
     pub fn check_as<I: Repr>(self, i: I) -> Option<Index<'id, I>> {
         match i.try_to_usize() {
-            Some(u) if u < self.n => Some(Index { raw: i, brand: self.brand }),
+            Some(u) if u < self.n => Some(Index {
+                raw: i,
+                brand: self.brand,
+            }),
             _ => None,
         }
     }
@@ -163,7 +176,11 @@ impl<'id> Len<'id> {
     /// Iterates over every index `0..n`. No per-element checks.
     #[inline(always)]
     pub fn indices(self) -> Range<'id> {
-        Range { start: 0, end: self.n, brand: self.brand }
+        Range {
+            start: 0,
+            end: self.n,
+            brand: self.brand,
+        }
     }
 
     /// Iterates over every index `0..n` in the compact representation `I`. Returns `None` when
@@ -175,15 +192,21 @@ impl<'id> Len<'id> {
         let fits = self.n == 0 || I::try_from_usize(self.n - 1).is_some();
         // `narrow` is lossless here: every value is `< n` and `n - 1` fits in `I`.
         fits.then(|| {
-            self.indices()
-                .map(|i| Index { raw: I::narrow(i.raw), brand: i.brand })
+            self.indices().map(|i| Index {
+                raw: I::narrow(i.raw),
+                brand: i.brand,
+            })
         })
     }
 
     /// Validates `start <= end <= n` and returns the branded range.
     #[inline(always)]
     pub fn range(self, start: usize, end: usize) -> Option<Range<'id>> {
-        (start <= end && end <= self.n).then_some(Range { start, end, brand: self.brand })
+        (start <= end && end <= self.n).then_some(Range {
+            start,
+            end,
+            brand: self.brand,
+        })
     }
 
     /// Validates fenceposts: `s` must be non-decreasing with every element `<= n`. Each adjacent
@@ -193,28 +216,41 @@ impl<'id> Len<'id> {
     pub fn offsets<'a>(self, s: &'a [usize]) -> Option<Offsets<'id, 'a>> {
         let sorted = s.windows(2).all(|w| w[0] <= w[1]);
         let in_range = s.last().is_none_or(|&e| e <= self.n);
-        (sorted && in_range).then_some(Offsets { s, brand: self.brand })
+        (sorted && in_range).then_some(Offsets {
+            s,
+            brand: self.brand,
+        })
     }
 
     /// Views the `n` elements as a row-major grid `width` wide. Requires `width > 0` and `n` a
     /// multiple of `width`.
     #[inline(always)]
+    #[allow(clippy::manual_is_multiple_of)] // `is_multiple_of` needs 1.87; MSRV is 1.85
     pub fn grid(self, width: usize) -> Option<Grid<'id>> {
-        (width > 0 && self.n.is_multiple_of(width))
-            .then(|| Grid { w: width, h: self.n / width, brand: self.brand })
+        (width > 0 && self.n % width == 0).then(|| Grid {
+            w: width,
+            h: self.n / width,
+            brand: self.brand,
+        })
     }
 
     /// Brands `s` if its length is exactly `n`.
     #[inline(always)]
     pub fn brand<'a, T>(self, s: &'a [T]) -> Option<Slice<'id, 'a, T>> {
-        (s.len() == self.n).then_some(Slice { s, brand: self.brand })
+        (s.len() == self.n).then_some(Slice {
+            s,
+            brand: self.brand,
+        })
     }
 
     /// Brands `s` mutably if its length is exactly `n`.
     #[inline(always)]
     pub fn brand_mut<'a, T>(self, s: &'a mut [T]) -> Option<SliceMut<'id, 'a, T>> {
         if s.len() == self.n {
-            Some(SliceMut { s, brand: self.brand })
+            Some(SliceMut {
+                s,
+                brand: self.brand,
+            })
         } else {
             None
         }
@@ -298,7 +334,10 @@ impl<'id, I: Repr> Index<'id, I> {
     /// Converts to another representation, checking that the value fits.
     #[inline(always)]
     pub fn to_repr<J: Repr>(self) -> Option<Index<'id, J>> {
-        J::try_from_usize(self.get()).map(|raw| Index { raw, brand: self.brand })
+        J::try_from_usize(self.get()).map(|raw| Index {
+            raw,
+            brand: self.brand,
+        })
     }
 }
 
@@ -355,7 +394,10 @@ impl<'id> Iterator for Range<'id> {
         if self.start < self.end {
             let raw = self.start;
             self.start += 1;
-            Some(Index { raw, brand: self.brand })
+            Some(Index {
+                raw,
+                brand: self.brand,
+            })
         } else {
             None
         }
@@ -372,7 +414,10 @@ impl DoubleEndedIterator for Range<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.start < self.end {
             self.end -= 1;
-            Some(Index { raw: self.end, brand: self.brand })
+            Some(Index {
+                raw: self.end,
+                brand: self.brand,
+            })
         } else {
             None
         }
@@ -422,7 +467,11 @@ impl<'id, 'a> Offsets<'id, 'a> {
             Some((&first, rest)) => (first, rest),
             None => (0, &[][..]),
         };
-        Ranges { prev, rest: rest.iter(), brand: self.brand }
+        Ranges {
+            prev,
+            rest: rest.iter(),
+            brand: self.brand,
+        }
     }
 }
 
@@ -443,7 +492,11 @@ impl<'id> Iterator for Ranges<'id, '_> {
     fn next(&mut self) -> Option<Range<'id>> {
         let &end = self.rest.next()?;
         // Validated by `Len::offsets`: adjacent offsets satisfy `prev <= end <= n`.
-        let r = Range { start: self.prev, end, brand: self.brand };
+        let r = Range {
+            start: self.prev,
+            end,
+            brand: self.brand,
+        };
         self.prev = end;
         Some(r)
     }
@@ -459,7 +512,11 @@ impl DoubleEndedIterator for Ranges<'_, '_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         let &end = self.rest.next_back()?;
         let start = self.rest.as_slice().last().copied().unwrap_or(self.prev);
-        Some(Range { start, end, brand: self.brand })
+        Some(Range {
+            start,
+            end,
+            brand: self.brand,
+        })
     }
 }
 
@@ -469,6 +526,205 @@ impl FusedIterator for Ranges<'_, '_> {}
 impl fmt::Debug for Offsets<'_, '_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Offsets").field(&self.s).finish()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Persistent validated data
+// ---------------------------------------------------------------------------------------------
+
+/// Validation failure: the rejected input, returned unchanged, and where it failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invalid<T> {
+    /// The input, handed back so it is not lost.
+    pub input: T,
+    /// Position of the first element that failed validation.
+    pub position: usize,
+}
+
+impl<T> fmt::Display for Invalid<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "validation failed at position {}", self.position)
+    }
+}
+
+impl<T: fmt::Debug> core::error::Error for Invalid<T> {}
+
+/// Owned indices, each validated `< bound`, that live outside any brand scope.
+///
+/// Validation is `O(n)`, once, at construction. Afterwards [`view`](Self::view) re-brands the
+/// whole list for any [`Len<'id>`] with `n >= bound`, at the cost of one comparison. Keep it in
+/// your own structs, across calls; open a scope only where you index.
+///
+/// The indices are immutable apart from checked [`push`](Self::push), so the invariant cannot
+/// be broken after validation.
+///
+/// ```
+/// use branded_index::{ValidIndices, scope};
+///
+/// struct Lookup {
+///     idx: ValidIndices<u32>,
+/// }
+///
+/// let data = [1.0, 2.0, 3.0];
+/// let lookup = Lookup { idx: ValidIndices::new(vec![2u32, 0, 1, 2], data.len()).unwrap() };
+///
+/// // Later, any number of times:
+/// let sum: f64 = scope(&data, |d| {
+///     let idx = lookup.idx.view(d.len()).unwrap(); // one comparison
+///     idx.iter().map(|&i| d[i]).sum()              // no bounds checks
+/// });
+/// assert_eq!(sum, 9.0);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidIndices<I: Repr = usize> {
+    v: Vec<I>,
+    bound: usize,
+}
+
+impl<I: Repr> ValidIndices<I> {
+    /// Validates that every element is `< bound`.
+    pub fn new(v: Vec<I>, bound: usize) -> Result<Self, Invalid<Vec<I>>> {
+        match v
+            .iter()
+            .position(|&i| !i.try_to_usize().is_some_and(|u| u < bound))
+        {
+            Some(position) => Err(Invalid { input: v, position }),
+            None => Ok(ValidIndices { v, bound }),
+        }
+    }
+
+    /// An empty list for indices `< bound`.
+    pub fn empty(bound: usize) -> Self {
+        ValidIndices {
+            v: Vec::new(),
+            bound,
+        }
+    }
+
+    /// Persists indices that were already validated inside a scope. No checks.
+    pub fn from_branded<'id>(len: Len<'id>, v: Vec<Index<'id, I>>) -> Self {
+        ValidIndices {
+            v: v.into_iter().map(Index::raw).collect(),
+            bound: len.n,
+        }
+    }
+
+    /// Appends `i` if it is `< bound`; otherwise hands it back.
+    pub fn push(&mut self, i: I) -> Result<(), I> {
+        if i.try_to_usize().is_some_and(|u| u < self.bound) {
+            self.v.push(i);
+            Ok(())
+        } else {
+            Err(i)
+        }
+    }
+
+    /// The bound every index is below.
+    #[inline(always)]
+    pub fn bound(&self) -> usize {
+        self.bound
+    }
+
+    /// Number of indices.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    /// `true` when there are no indices.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.v.is_empty()
+    }
+
+    /// The raw indices.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[I] {
+        &self.v
+    }
+
+    /// The raw indices, by value.
+    pub fn into_inner(self) -> Vec<I> {
+        self.v
+    }
+
+    /// The indices branded for `len`, if `len.get() >= bound`. One comparison, no copy.
+    #[inline(always)]
+    pub fn view<'id>(&self, len: Len<'id>) -> Option<&[Index<'id, I>]> {
+        if self.bound <= len.n {
+            // SAFETY: `Index<'id, I>` is `repr(transparent)` over `I` (the brand is a 1-aligned
+            // ZST), so `[I]` and `[Index<'id, I>]` have identical layout. Every element is
+            // `< bound <= n` (validated by `new`/`push`, or already branded in `from_branded`),
+            // which is exactly the invariant `Index<'id, I>` requires. The shared borrow of
+            // `self` keeps the elements from changing while the view lives.
+            Some(unsafe { core::slice::from_raw_parts(self.v.as_ptr().cast(), self.v.len()) })
+        } else {
+            None
+        }
+    }
+}
+
+/// Owned fenceposts, validated non-decreasing with every element `<= bound`, that live
+/// outside any brand scope. The persistent form of [`Offsets`].
+///
+/// ```
+/// use branded_index::{ValidOffsets, scope};
+///
+/// let words = ValidOffsets::new(vec![0, 5, 5, 11], 11).unwrap(); // in a long-lived struct
+/// let text = *b"helloworld!";
+/// scope(&text, |t| {
+///     let parts: Vec<&[u8]> = words.view(t.len()).unwrap().ranges().map(|r| &t[r]).collect();
+///     assert_eq!(parts, [&b"hello"[..], b"", b"world!"]);
+/// });
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ValidOffsets {
+    v: Vec<usize>,
+    bound: usize,
+}
+
+impl ValidOffsets {
+    /// Validates that `v` is non-decreasing and every element is `<= bound`.
+    pub fn new(v: Vec<usize>, bound: usize) -> Result<Self, Invalid<Vec<usize>>> {
+        let bad = (0..v.len()).find(|&i| v[i] > bound || (i > 0 && v[i] < v[i - 1]));
+        match bad {
+            Some(position) => Err(Invalid { input: v, position }),
+            None => Ok(ValidOffsets { v, bound }),
+        }
+    }
+
+    /// The bound every offset is at most.
+    #[inline(always)]
+    pub fn bound(&self) -> usize {
+        self.bound
+    }
+
+    /// Number of ranges, one less than the number of offsets.
+    #[inline(always)]
+    pub fn ranges_len(&self) -> usize {
+        self.v.len().saturating_sub(1)
+    }
+
+    /// The raw offsets.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[usize] {
+        &self.v
+    }
+
+    /// The raw offsets, by value.
+    pub fn into_inner(self) -> Vec<usize> {
+        self.v
+    }
+
+    /// The offsets branded for `len`, if `len.get() >= bound`. One comparison, no copy.
+    #[inline(always)]
+    pub fn view<'id>(&self, len: Len<'id>) -> Option<Offsets<'id, '_>> {
+        // Non-decreasing and `<= bound <= n`: exactly what `Len::offsets` would check.
+        (self.bound <= len.n).then_some(Offsets {
+            s: &self.v,
+            brand: len.brand,
+        })
     }
 }
 
@@ -501,14 +757,20 @@ impl<'id> Grid<'id> {
     /// The branded length `width * height`.
     #[inline(always)]
     pub fn len(self) -> Len<'id> {
-        Len { n: self.w * self.h, brand: self.brand }
+        Len {
+            n: self.w * self.h,
+            brand: self.brand,
+        }
     }
 
     /// Index of cell (`row`, `col`), checked.
     #[inline(always)]
     pub fn at(self, row: usize, col: usize) -> Option<Index<'id>> {
         // `row * w + col < h * w == n`, so no overflow.
-        (row < self.h && col < self.w).then(|| Index { raw: row * self.w + col, brand: self.brand })
+        (row < self.h && col < self.w).then(|| Index {
+            raw: row * self.w + col,
+            brand: self.brand,
+        })
     }
 
     /// The interior cells at distance `>= R` from every edge, one row at a time. Every cell
@@ -518,7 +780,12 @@ impl<'id> Grid<'id> {
     pub fn interior_rows<const R: usize>(self) -> InteriorRows<'id, R> {
         let fits = R.checked_mul(2).is_some_and(|d| self.w > d && self.h > d);
         let (row, row_end) = if fits { (R, self.h - R) } else { (0, 0) };
-        InteriorRows { row, row_end, w: self.w, brand: self.brand }
+        InteriorRows {
+            row,
+            row_end,
+            w: self.w,
+            brand: self.brand,
+        }
     }
 }
 
@@ -543,7 +810,10 @@ impl<'id, const R: usize> Interior<'id, R> {
     /// The cell itself.
     #[inline(always)]
     pub fn center(self) -> Index<'id> {
-        Index { raw: self.raw, brand: self.brand }
+        Index {
+            raw: self.raw,
+            brand: self.brand,
+        }
     }
 
     /// The cell `DR` rows and `DC` columns away. `|DR|` and `|DC|` must be `<= R`; this is
@@ -571,7 +841,10 @@ impl<'id, const R: usize> Interior<'id, R> {
         // `0 <= row + DR < h` and `0 <= col + DC < w`, so the true value lies in `0..n`.
         // Wrapping arithmetic computes it modulo 2^usize::BITS, which is then exact.
         let offset = (DR as usize).wrapping_mul(self.w).wrapping_add(DC as usize);
-        Index { raw: self.raw.wrapping_add(offset), brand: self.brand }
+        Index {
+            raw: self.raw.wrapping_add(offset),
+            brand: self.brand,
+        }
     }
 
     /// One row up. Needs `R >= 1`.
@@ -673,7 +946,11 @@ impl<'id, const R: usize> Iterator for InteriorRow<'id, R> {
         if self.cur < self.end {
             let raw = self.cur;
             self.cur += 1;
-            Some(Interior { raw, w: self.w, brand: self.brand })
+            Some(Interior {
+                raw,
+                w: self.w,
+                brand: self.brand,
+            })
         } else {
             None
         }
@@ -691,7 +968,11 @@ impl<const R: usize> DoubleEndedIterator for InteriorRow<'_, R> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.cur < self.end {
             self.end -= 1;
-            Some(Interior { raw: self.end, w: self.w, brand: self.brand })
+            Some(Interior {
+                raw: self.end,
+                w: self.w,
+                brand: self.brand,
+            })
         } else {
             None
         }
@@ -723,7 +1004,10 @@ impl<'id, 'a, T> Slice<'id, 'a, T> {
     /// The branded length.
     #[inline(always)]
     pub fn len(self) -> Len<'id> {
-        Len { n: self.s.len(), brand: self.brand }
+        Len {
+            n: self.s.len(),
+            brand: self.brand,
+        }
     }
 
     /// The underlying slice.
@@ -779,7 +1063,10 @@ impl<'id, 'a, T> SliceMut<'id, 'a, T> {
     /// The branded length.
     #[inline(always)]
     pub fn len(&self) -> Len<'id> {
-        Len { n: self.s.len(), brand: self.brand }
+        Len {
+            n: self.s.len(),
+            brand: self.brand,
+        }
     }
 
     /// The underlying slice, shared.
@@ -797,13 +1084,19 @@ impl<'id, 'a, T> SliceMut<'id, 'a, T> {
     /// A shorter-lived branded view, so the slice can be passed on and used again afterwards.
     #[inline(always)]
     pub fn reborrow(&mut self) -> SliceMut<'id, '_, T> {
-        SliceMut { s: self.s, brand: self.brand }
+        SliceMut {
+            s: self.s,
+            brand: self.brand,
+        }
     }
 
     /// A shared branded view.
     #[inline(always)]
     pub fn as_shared(&self) -> Slice<'id, '_, T> {
-        Slice { s: self.s, brand: self.brand }
+        Slice {
+            s: self.s,
+            brand: self.brand,
+        }
     }
 
     /// Mutable element at `i`. Never checks.
@@ -963,7 +1256,11 @@ mod tests {
         // 4 rows x 5 cols; radius-1 interior is rows 1..3, cols 1..4.
         with_len(20, |n| {
             let g = n.grid(5).unwrap();
-            let cells: Vec<_> = g.interior_rows::<1>().flatten().map(|i| (i.row(), i.col())).collect();
+            let cells: Vec<_> = g
+                .interior_rows::<1>()
+                .flatten()
+                .map(|i| (i.row(), i.col()))
+                .collect();
             assert_eq!(cells, [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3)]);
             for i in g.interior_rows::<1>().flatten() {
                 let c = i.center().get();
@@ -974,7 +1271,13 @@ mod tests {
                 assert_eq!(i.at::<-1, 1>().get(), c - 4);
                 assert_eq!(i.at::<1, -1>().get(), c + 4);
             }
-            let rev: Vec<_> = g.interior_rows::<1>().next().unwrap().rev().map(|i| i.col()).collect();
+            let rev: Vec<_> = g
+                .interior_rows::<1>()
+                .next()
+                .unwrap()
+                .rev()
+                .map(|i| i.col())
+                .collect();
             assert_eq!(rev, [3, 2, 1]);
         });
     }
@@ -999,12 +1302,91 @@ mod tests {
             assert_eq!(n.grid(2).unwrap().interior_rows::<1>().count(), 0); // 2 cols
             assert_eq!(n.grid(6).unwrap().interior_rows::<0>().flatten().count(), 6);
         });
-        with_len(0, |n| assert_eq!(n.grid(1).unwrap().interior_rows::<1>().count(), 0));
+        with_len(0, |n| {
+            assert_eq!(n.grid(1).unwrap().interior_rows::<1>().count(), 0)
+        });
         with_len(9, |n| {
             let g = n.grid(3).unwrap();
             assert_eq!(g.interior_rows::<{ usize::MAX }>().count(), 0);
-            assert_eq!(g.interior_rows::<1>().flatten().map(|i| i.center().get()).collect::<Vec<_>>(), [4]);
+            assert_eq!(
+                g.interior_rows::<1>()
+                    .flatten()
+                    .map(|i| i.center().get())
+                    .collect::<Vec<_>>(),
+                [4]
+            );
         });
+    }
+
+    #[test]
+    fn valid_indices_validation() {
+        let err = ValidIndices::new(alloc::vec![0u32, 4, 5, 1], 5).unwrap_err();
+        assert_eq!((err.position, err.input.len()), (2, 4));
+        assert!(ValidIndices::new(alloc::vec![u64::MAX], usize::MAX).is_err());
+        assert!(ValidIndices::<u8>::new(Vec::new(), 0).unwrap().is_empty());
+
+        let mut v = ValidIndices::new(alloc::vec![0u32, 4], 5).unwrap();
+        assert_eq!(v.push(5), Err(5));
+        assert_eq!(v.push(3), Ok(()));
+        assert_eq!((v.as_slice(), v.bound()), (&[0, 4, 3][..], 5));
+    }
+
+    #[test]
+    fn valid_indices_view() {
+        let v = ValidIndices::new(alloc::vec![0u32, 4, 2], 5).unwrap();
+        let data = [10, 11, 12, 13, 14, 15];
+        with_len(4, |n| assert!(v.view(n).is_none()));
+        // A larger `n` is fine: `i < 5 <= 6`.
+        scope(&data, |d| {
+            let idx = v.view(d.len()).unwrap();
+            assert_eq!(idx.iter().map(|&i| d[i]).collect::<Vec<_>>(), [10, 14, 12]);
+        });
+    }
+
+    #[test]
+    fn valid_indices_from_branded_round_trip() {
+        let v = with_len(7, |n| {
+            let idx: Vec<_> = [6usize, 0, 3]
+                .iter()
+                .map(|&i| n.check_as(i as u16).unwrap())
+                .collect();
+            ValidIndices::from_branded(n, idx)
+        });
+        assert_eq!((v.as_slice(), v.bound()), (&[6u16, 0, 3][..], 7));
+        with_len(7, |n| assert_eq!(v.view(n).unwrap()[0].get(), 6));
+    }
+
+    #[test]
+    fn valid_offsets() {
+        assert_eq!(
+            ValidOffsets::new(alloc::vec![0, 3, 2], 5)
+                .unwrap_err()
+                .position,
+            2
+        );
+        assert_eq!(
+            ValidOffsets::new(alloc::vec![0, 6], 5)
+                .unwrap_err()
+                .position,
+            1
+        );
+        assert_eq!(
+            ValidOffsets::new(alloc::vec![7], 5).unwrap_err().position,
+            0
+        );
+        let o = ValidOffsets::new(alloc::vec![0, 2, 2, 5], 5).unwrap();
+        assert_eq!(o.ranges_len(), 3);
+        with_len(4, |n| assert!(o.view(n).is_none()));
+        with_len(5, |n| {
+            let r: Vec<_> = o
+                .view(n)
+                .unwrap()
+                .ranges()
+                .map(|r| (r.start(), r.end()))
+                .collect();
+            assert_eq!(r, [(0, 2), (2, 2), (2, 5)]);
+        });
+        assert_eq!(ValidOffsets::new(Vec::new(), 0).unwrap().ranges_len(), 0);
     }
 
     #[test]
@@ -1047,7 +1429,10 @@ mod tests {
     #[test]
     fn compact_index_is_small() {
         assert_eq!(core::mem::size_of::<Index<'static, u32>>(), 4);
-        assert_eq!(core::mem::size_of::<Index<'static>>(), core::mem::size_of::<usize>());
+        assert_eq!(
+            core::mem::size_of::<Index<'static>>(),
+            core::mem::size_of::<usize>()
+        );
         assert_eq!(core::mem::size_of::<Option<Index<'static, u32>>>(), 8);
     }
 }

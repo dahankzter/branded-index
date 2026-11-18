@@ -1,6 +1,6 @@
-use branded_index::kernels::{add, gather, rng, spmv, stencil, union_find};
-use branded_index::{scope, with_len};
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use branded_index::{ValidIndices, scope, with_len};
+use branded_index_bench::{add, gather, rng, spmv, stencil, union_find};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -17,11 +17,21 @@ fn bench_add(c: &mut Criterion) {
 
         let mut g = c.benchmark_group(format!("add/{label}"));
         g.throughput(Throughput::Elements(n as u64));
-        g.bench_function("checked", |bn| bn.iter(|| add::checked(black_box(&a), black_box(&b), &mut out)));
-        g.bench_function("hoisted", |bn| bn.iter(|| add::hoisted(black_box(&a), black_box(&b), &mut out)));
-        g.bench_function("idiomatic", |bn| bn.iter(|| add::idiomatic(black_box(&a), black_box(&b), &mut out)));
-        g.bench_function("unchecked", |bn| bn.iter(|| add::unchecked(black_box(&a), black_box(&b), &mut out)));
-        g.bench_function("branded", |bn| bn.iter(|| add::branded(black_box(&a), black_box(&b), &mut out)));
+        g.bench_function("checked", |bn| {
+            bn.iter(|| add::checked(black_box(&a), black_box(&b), &mut out))
+        });
+        g.bench_function("hoisted", |bn| {
+            bn.iter(|| add::hoisted(black_box(&a), black_box(&b), &mut out))
+        });
+        g.bench_function("idiomatic", |bn| {
+            bn.iter(|| add::idiomatic(black_box(&a), black_box(&b), &mut out))
+        });
+        g.bench_function("unchecked", |bn| {
+            bn.iter(|| add::unchecked(black_box(&a), black_box(&b), &mut out))
+        });
+        g.bench_function("branded", |bn| {
+            bn.iter(|| add::branded(black_box(&a), black_box(&b), &mut out))
+        });
         g.finish();
     }
 }
@@ -36,17 +46,28 @@ fn bench_gather(c: &mut Criterion) {
 
         let mut g = c.benchmark_group(format!("gather/{label}"));
         g.throughput(Throughput::Elements(count as u64));
-        g.bench_function("checked", |bn| bn.iter(|| gather::checked(black_box(&data), black_box(&idx), &mut out)));
+        g.bench_function("checked", |bn| {
+            bn.iter(|| gather::checked(black_box(&data), black_box(&idx), &mut out))
+        });
         g.bench_function("unchecked", |bn| {
             // SAFETY: every index was generated `< n == data.len()`.
             bn.iter(|| unsafe { gather::unchecked(black_box(&data), black_box(&idx), &mut out) })
         });
-        scope(&data, |d| {
-            let v = gather::validate(d.len(), &idx).unwrap();
-            g.bench_function("branded", |bn| bn.iter(|| gather::branded(black_box(d), black_box(&v), &mut out)));
+        // Validated once, stored outside any scope; each call re-brands it with one comparison.
+        let valid = ValidIndices::new(idx.clone(), n).unwrap();
+        g.bench_function("branded", |bn| {
+            bn.iter(|| {
+                scope(black_box(&data), |d| {
+                    gather::branded(d, valid.view(d.len()).unwrap(), &mut out)
+                })
+            })
         });
         g.bench_function("validate (one-off)", |bn| {
-            bn.iter(|| with_len(n, |len| gather::validate(len, black_box(&idx)).map(|v| v.len())))
+            bn.iter_batched(
+                || idx.clone(),
+                |v| ValidIndices::new(v, n).map(|v| v.len()),
+                BatchSize::LargeInput,
+            )
         });
         g.finish();
     }
@@ -61,25 +82,23 @@ fn bench_spmv(c: &mut Criterion) {
 
         let mut g = c.benchmark_group(format!("spmv/{label}"));
         g.throughput(Throughput::Elements(a.vals.len() as u64));
-        g.bench_function("checked", |bn| bn.iter(|| spmv::checked(black_box(&a), black_box(&x), &mut y)));
-        g.bench_function("idiomatic", |bn| bn.iter(|| spmv::idiomatic(black_box(&a), black_box(&x), &mut y)));
+        g.bench_function("checked", |bn| {
+            bn.iter(|| spmv::checked(black_box(&a), black_box(&x), &mut y))
+        });
+        g.bench_function("idiomatic", |bn| {
+            bn.iter(|| spmv::idiomatic(black_box(&a), black_box(&x), &mut y))
+        });
         g.bench_function("unchecked", |bn| {
             // SAFETY: `Csr::random` builds a well-formed matrix and `x.len() == ncols`.
             bn.iter(|| unsafe { spmv::unchecked(black_box(&a), black_box(&x), &mut y) })
         });
-        with_len(a.vals.len(), |z| {
-            with_len(a.ncols, |cl| {
-                let m = spmv::validate(z, cl, &a).unwrap();
-                let (cols, vals, xb) = (z.brand(&m.cols).unwrap(), z.brand(&a.vals).unwrap(), cl.brand(&x).unwrap());
-                g.bench_function("branded", |bn| {
-                    bn.iter(|| spmv::branded(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
-                });
-            })
+        // Validated once into a plain struct; each call re-brands it with O(1) checks.
+        let m = spmv::ValidCsr::new(&a).unwrap();
+        g.bench_function("branded", |bn| {
+            bn.iter(|| black_box(&m).mul_with(spmv::branded, black_box(&x), &mut y))
         });
         g.bench_function("validate (one-off)", |bn| {
-            bn.iter(|| {
-                with_len(a.vals.len(), |z| with_len(a.ncols, |cl| spmv::validate(z, cl, black_box(&a)).is_some()))
-            })
+            bn.iter(|| spmv::ValidCsr::new(black_box(&a)).is_some())
         });
         g.finish();
     }
@@ -120,7 +139,11 @@ fn bench_union_find(c: &mut Criterion) {
             });
         });
         g.bench_function("validate (one-off)", |bn| {
-            bn.iter(|| with_len(n, |len| union_find::validate_ops(len, black_box(&ops)).map(|v| v.len())))
+            bn.iter(|| {
+                with_len(n, |len| {
+                    union_find::validate_ops(len, black_box(&ops)).map(|v| v.len())
+                })
+            })
         });
         g.finish();
     }
@@ -135,8 +158,12 @@ fn bench_stencil(c: &mut Criterion) {
 
         let mut g = c.benchmark_group(format!("stencil/{label}"));
         g.throughput(Throughput::Elements(((side - 2) * (side - 2)) as u64));
-        g.bench_function("checked", |bn| bn.iter(|| stencil::checked(black_box(&a), &mut out, black_box(side))));
-        g.bench_function("idiomatic", |bn| bn.iter(|| stencil::idiomatic(black_box(&a), &mut out, black_box(side))));
+        g.bench_function("checked", |bn| {
+            bn.iter(|| stencil::checked(black_box(&a), &mut out, black_box(side)))
+        });
+        g.bench_function("idiomatic", |bn| {
+            bn.iter(|| stencil::idiomatic(black_box(&a), &mut out, black_box(side)))
+        });
         g.bench_function("unchecked", |bn| {
             // SAFETY: equal lengths, `n` a multiple of `side`.
             bn.iter(|| unsafe { stencil::unchecked(black_box(&a), &mut out, black_box(side)) })
@@ -155,7 +182,11 @@ fn bench_stencil(c: &mut Criterion) {
 
 fn bench_spmv_reassoc(c: &mut Criterion) {
     // (label, rows = cols, nonzeros per row)
-    for (label, n, per_row) in [("small-16", 1 << 10, 16), ("large-16", 1 << 16, 16), ("wide-256", 1 << 12, 256)] {
+    for (label, n, per_row) in [
+        ("small-16", 1 << 10, 16),
+        ("large-16", 1 << 16, 16),
+        ("wide-256", 1 << 12, 256),
+    ] {
         let a = spmv::Csr::random(n, n, per_row, 3);
         let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
         let mut y = vec![0.0f64; n];
@@ -166,27 +197,19 @@ fn bench_spmv_reassoc(c: &mut Criterion) {
             // SAFETY: `Csr::random` builds a well-formed matrix and `x.len() == ncols`.
             bn.iter(|| unsafe { spmv::unchecked(black_box(&a), black_box(&x), &mut y) })
         });
-        with_len(a.vals.len(), |z| {
-            with_len(a.ncols, |cl| {
-                let m = spmv::validate(z, cl, &a).unwrap();
-                let (cols, vals, xb) = (z.brand(&m.cols).unwrap(), z.brand(&a.vals).unwrap(), cl.brand(&x).unwrap());
-                g.bench_function("branded", |bn| {
-                    bn.iter(|| spmv::branded(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
-                });
-                g.bench_function("reassoc K=2", |bn| {
-                    bn.iter(|| spmv::branded_reassoc::<2>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
-                });
-                g.bench_function("reassoc K=4", |bn| {
-                    bn.iter(|| spmv::branded_reassoc::<4>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
-                });
-                g.bench_function("adaptive", |bn| {
-                    bn.iter(|| spmv::branded_adaptive(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
-                });
-                g.bench_function("reassoc K=8", |bn| {
-                    bn.iter(|| spmv::branded_reassoc::<8>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
-                });
-            })
-        });
+        let m = spmv::ValidCsr::new(&a).unwrap();
+        let kernels: [(&str, spmv::Kernel); 5] = [
+            ("branded", spmv::branded),
+            ("reassoc K=2", spmv::branded_reassoc::<2>),
+            ("reassoc K=4", spmv::branded_reassoc::<4>),
+            ("adaptive", spmv::branded_adaptive),
+            ("reassoc K=8", spmv::branded_reassoc::<8>),
+        ];
+        for (name, kernel) in kernels {
+            g.bench_function(name, |bn| {
+                bn.iter(|| black_box(&m).mul_with(kernel, black_box(&x), &mut y))
+            });
+        }
         g.finish();
     }
 }

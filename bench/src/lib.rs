@@ -6,12 +6,13 @@
 //! - `branded`: this crate. Safe; checks paid once at validation (`validate_*`).
 //!
 //! Functions are `#[inline(never)]` so each variant can be read in the disassembly.
-//! This module exists for the benchmarks and tests; it is not part of the crate's API.
+//! Benchmark-only crate; not published.
 
 #![allow(missing_docs)]
 
-use crate::{Grid, Index, Len, Offsets, Slice, SliceMut};
-use alloc::vec::Vec;
+use branded_index::{
+    Grid, Index, Len, Offsets, Slice, SliceMut, ValidIndices, ValidOffsets, with_len,
+};
 
 /// splitmix64: small deterministic RNG so inputs need no extra dependency.
 pub fn rng(mut state: u64) -> impl FnMut() -> u64 {
@@ -62,7 +63,7 @@ pub mod add {
 
     #[inline(never)]
     pub fn branded(a: &[f32], b: &[f32], c: &mut [f32]) {
-        crate::with_len(c.len(), |n| {
+        branded_index::with_len(c.len(), |n| {
             let a = n.brand(&a[..n.get()]).unwrap();
             let b = n.brand(&b[..n.get()]).unwrap();
             let mut c = n.brand_mut(c).unwrap();
@@ -93,12 +94,6 @@ pub mod gather {
             // SAFETY: caller guarantees `i < data.len()`.
             *o = unsafe { *data.get_unchecked(i as usize) };
         }
-    }
-
-    /// One check per index, paid once.
-    #[inline(never)]
-    pub fn validate<'id>(n: Len<'id>, idx: &[u32]) -> Option<Vec<Index<'id, u32>>> {
-        idx.iter().map(|&i| n.check_as(i)).collect()
     }
 
     #[inline(never)]
@@ -137,7 +132,13 @@ pub mod spmv {
                 }
                 row_ptr.push(cols.len());
             }
-            Csr { nrows, ncols, row_ptr, cols, vals }
+            Csr {
+                nrows,
+                ncols,
+                row_ptr,
+                cols,
+                vals,
+            }
         }
     }
 
@@ -184,22 +185,68 @@ pub mod spmv {
         }
     }
 
-    /// The validated matrix. `'z` brands the nonzero arrays, `'c` brands the column space.
-    /// Row boundaries stay as the original `row_ptr` (8 bytes per row), only validated.
-    pub struct BrandedCsr<'z, 'c, 'a> {
-        pub rows: Offsets<'z, 'a>,
-        pub cols: Vec<Index<'c, u32>>,
+    /// A branded SpMV kernel: row offsets and columns into the nonzeros (`'z`), column indices
+    /// into `x` (`'c`).
+    pub type Kernel = for<'z, 'c, 'a> fn(
+        Offsets<'z, 'a>,
+        Slice<'z, 'a, Index<'c, u32>>,
+        Slice<'z, 'a, f64>,
+        Slice<'c, 'a, f64>,
+        &'a mut [f64],
+    );
+
+    /// A CSR matrix validated once, at construction, that lives in ordinary code: no brand
+    /// lifetimes in its type, and no `unsafe` anywhere in its implementation. Each
+    /// multiplication re-brands it with O(1) checks.
+    #[derive(Clone, Debug)]
+    pub struct ValidCsr {
+        nrows: usize,
+        ncols: usize,
+        row_ptr: ValidOffsets,
+        cols: ValidIndices<u32>,
+        vals: Vec<f64>,
     }
 
-    /// Checks every row range and every column index once.
-    #[inline(never)]
-    pub fn validate<'z, 'c, 'a>(z: Len<'z>, c: Len<'c>, a: &'a Csr) -> Option<BrandedCsr<'z, 'c, 'a>> {
-        if a.row_ptr.len() != a.nrows + 1 {
-            return None;
+    impl ValidCsr {
+        /// Checks every row boundary and every column index once.
+        pub fn new(a: &Csr) -> Option<ValidCsr> {
+            if a.row_ptr.len() != a.nrows + 1 || a.cols.len() != a.vals.len() {
+                return None;
+            }
+            let nnz = a.vals.len();
+            Some(ValidCsr {
+                nrows: a.nrows,
+                ncols: a.ncols,
+                row_ptr: ValidOffsets::new(a.row_ptr.clone(), nnz).ok()?,
+                cols: ValidIndices::new(a.cols.clone(), a.ncols).ok()?,
+                vals: a.vals.clone(),
+            })
         }
-        let rows = z.offsets(&a.row_ptr)?;
-        let cols = a.cols.iter().map(|&i| c.check_as(i)).collect::<Option<_>>()?;
-        Some(BrandedCsr { rows, cols })
+
+        pub fn nrows(&self) -> usize {
+            self.nrows
+        }
+
+        pub fn ncols(&self) -> usize {
+            self.ncols
+        }
+
+        /// `y = A x` using `kernel`. Panics unless `x.len() == ncols` and `y.len() == nrows`.
+        #[inline]
+        pub fn mul_with(&self, kernel: Kernel, x: &[f64], y: &mut [f64]) {
+            assert_eq!(x.len(), self.ncols, "x has the wrong length");
+            assert_eq!(y.len(), self.nrows, "y has the wrong length");
+            with_len(self.vals.len(), |z| {
+                with_len(self.ncols, |c| {
+                    // All O(1): bound comparisons and length checks, never a pass over the data.
+                    let rows = self.row_ptr.view(z).expect("row_ptr bound is nnz");
+                    let cols = self.cols.view(c).expect("column bound is ncols");
+                    let cols = z.brand(cols).expect("cols and vals have equal length");
+                    let vals = z.brand(&self.vals).expect("vals has length nnz");
+                    kernel(rows, cols, vals, c.brand(x).expect("checked above"), y)
+                })
+            })
+        }
     }
 
     #[inline(never)]
@@ -304,7 +351,9 @@ pub mod union_find {
 
     pub fn random_ops(n: usize, count: usize, seed: u64) -> Vec<(u32, u32)> {
         let mut r = rng(seed);
-        (0..count).map(|_| ((r() % n as u64) as u32, (r() % n as u64) as u32)).collect()
+        (0..count)
+            .map(|_| ((r() % n as u64) as u32, (r() % n as u64) as u32))
+            .collect()
     }
 
     #[inline(always)]
@@ -376,8 +425,13 @@ pub mod union_find {
     }
 
     #[inline(never)]
-    pub fn validate_ops<'id>(n: Len<'id>, ops: &[(u32, u32)]) -> Option<Vec<(Node<'id>, Node<'id>)>> {
-        ops.iter().map(|&(a, b)| Some((n.check_as(a)?, n.check_as(b)?))).collect()
+    pub fn validate_ops<'id>(
+        n: Len<'id>,
+        ops: &[(u32, u32)],
+    ) -> Option<Vec<(Node<'id>, Node<'id>)>> {
+        ops.iter()
+            .map(|&(a, b)| Some((n.check_as(a)?, n.check_as(b)?)))
+            .collect()
     }
 
     #[inline(always)]
@@ -394,7 +448,10 @@ pub mod union_find {
     }
 
     #[inline(never)]
-    pub fn branded<'id>(mut p: SliceMut<'id, '_, Node<'id>>, ops: &[(Node<'id>, Node<'id>)]) -> usize {
+    pub fn branded<'id>(
+        mut p: SliceMut<'id, '_, Node<'id>>,
+        ops: &[(Node<'id>, Node<'id>)],
+    ) -> usize {
         let mut unions = 0;
         for &(a, b) in ops {
             let (ra, rb) = (find_branded(&mut p, a), find_branded(&mut p, b));
@@ -475,8 +532,7 @@ pub mod stencil {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::with_len;
-    use alloc::vec;
+    use branded_index::with_len;
 
     fn floats(n: usize, seed: u64) -> Vec<f32> {
         let mut r = rng(seed);
@@ -509,17 +565,12 @@ mod tests {
         unsafe { gather::unchecked(&data, &idx, &mut got) };
         assert_eq!(got, want);
 
-        crate::scope(&data, |d| {
-            let v = gather::validate(d.len(), &idx).unwrap();
+        let v = ValidIndices::new(idx.clone(), data.len()).unwrap();
+        branded_index::scope(&data, |d| {
             let mut got = vec![0.0; idx.len()];
-            gather::branded(d, &v, &mut got);
+            gather::branded(d, v.view(d.len()).unwrap(), &mut got);
             assert_eq!(got, want);
         });
-    }
-
-    #[test]
-    fn gather_validation_rejects_out_of_range() {
-        with_len(10, |n| assert!(gather::validate(n, &[0, 9, 10]).is_none()));
     }
 
     #[test]
@@ -538,20 +589,10 @@ mod tests {
         unsafe { spmv::unchecked(&a, &x, &mut got) };
         assert_eq!(got, want);
 
-        with_len(a.vals.len(), |z| {
-            with_len(a.ncols, |c| {
-                let m = spmv::validate(z, c, &a).unwrap();
-                let mut got = vec![0.0; a.nrows];
-                spmv::branded(
-                    m.rows,
-                    z.brand(&m.cols).unwrap(),
-                    z.brand(&a.vals).unwrap(),
-                    c.brand(&x).unwrap(),
-                    &mut got,
-                );
-                assert_eq!(got, want);
-            })
-        });
+        let m = spmv::ValidCsr::new(&a).unwrap();
+        let mut got = vec![0.0; a.nrows];
+        m.mul_with(spmv::branded, &x, &mut got);
+        assert_eq!(got, want);
     }
 
     #[test]
@@ -572,57 +613,50 @@ mod tests {
         let mut want = vec![0.0; a.nrows];
         spmv::checked(&a, &x, &mut want);
 
-        fn run<const K: usize>(a: &spmv::Csr, x: &[f64]) -> Vec<f64> {
+        let m = spmv::ValidCsr::new(&a).unwrap();
+        let run = |kernel: spmv::Kernel| {
             let mut got = vec![0.0; a.nrows];
-            with_len(a.vals.len(), |z| {
-                with_len(a.ncols, |c| {
-                    let m = spmv::validate(z, c, a).unwrap();
-                    spmv::branded_reassoc::<K>(
-                        m.rows,
-                        z.brand(&m.cols).unwrap(),
-                        z.brand(&a.vals).unwrap(),
-                        c.brand(x).unwrap(),
-                        &mut got,
-                    );
-                })
-            });
+            m.mul_with(kernel, &x, &mut got);
             got
-        }
-        let mut adaptive = vec![0.0; a.nrows];
-        with_len(a.vals.len(), |z| {
-            with_len(a.ncols, |c| {
-                let m = spmv::validate(z, c, &a).unwrap();
-                spmv::branded_adaptive(
-                    m.rows,
-                    z.brand(&m.cols).unwrap(),
-                    z.brand(&a.vals).unwrap(),
-                    c.brand(&x).unwrap(),
-                    &mut adaptive,
-                );
-            })
-        });
+        };
+        let adaptive = run(spmv::branded_adaptive);
         for (r, (g, w)) in adaptive.iter().zip(&want).enumerate() {
             if a.row_ptr[r + 1] - a.row_ptr[r] < spmv::ADAPTIVE_MIN_ROW {
                 assert_eq!(g, w, "short rows keep the serial order");
             }
         }
-        for got in [run::<1>(&a, &x), run::<2>(&a, &x), run::<4>(&a, &x), run::<8>(&a, &x), adaptive] {
+        let variants = [
+            run(spmv::branded_reassoc::<1>),
+            run(spmv::branded_reassoc::<2>),
+            run(spmv::branded_reassoc::<4>),
+            run(spmv::branded_reassoc::<8>),
+            adaptive,
+        ];
+        for got in variants {
             for (g, w) in got.iter().zip(&want) {
                 assert!((g - w).abs() <= 1e-12 * w.abs().max(1.0), "{g} vs {w}");
             }
         }
-        assert_eq!(run::<1>(&a, &x), want, "K = 1 is the serial order");
+        assert_eq!(
+            run(spmv::branded_reassoc::<1>),
+            want,
+            "K = 1 is the serial order"
+        );
     }
 
     #[test]
     fn spmv_validation_rejects_bad_matrix() {
         let mut a = spmv::Csr::random(4, 4, 2, 5);
         a.cols[3] = 4;
-        with_len(a.vals.len(), |z| with_len(4, |c| assert!(spmv::validate(z, c, &a).is_none())));
+        assert!(spmv::ValidCsr::new(&a).is_none());
 
         let mut a = spmv::Csr::random(4, 4, 2, 5);
         a.row_ptr[2] = 100;
-        with_len(a.vals.len(), |z| with_len(4, |c| assert!(spmv::validate(z, c, &a).is_none())));
+        assert!(spmv::ValidCsr::new(&a).is_none());
+
+        let mut a = spmv::Csr::random(4, 4, 2, 5);
+        a.row_ptr[2] = 1; // decreasing
+        assert!(spmv::ValidCsr::new(&a).is_none());
     }
 
     #[test]

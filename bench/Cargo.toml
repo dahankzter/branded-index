@@ -1,0 +1,17 @@
+[package]
+name = "branded-index-bench"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Benchmark kernels for branded-index: checked, idiomatic, unchecked and branded variants"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+branded-index = { path = ".." }
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "kernels"
+harness = false

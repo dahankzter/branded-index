@@ -1,5 +1,9 @@
 # branded-index
 
+[![CI](https://github.com/dahankzter/branded-index/actions/workflows/ci.yml/badge.svg)](https://github.com/dahankzter/branded-index/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/branded-index.svg)](https://crates.io/crates/branded-index)
+[![docs.rs](https://docs.rs/branded-index/badge.svg)](https://docs.rs/branded-index)
+
 Branded indices for Rust. A bounds check is paid once, when an index is validated, instead of on
 every access. User code stays 100% safe. The handful of `get_unchecked` calls live inside the
 crate, each with a `SAFETY` argument.
@@ -13,6 +17,26 @@ branded_index::scope(&data, |d| {
     }
 });
 ```
+
+Validated data can also live in ordinary structs, outside any scope, and be re-branded in O(1)
+wherever it is used:
+
+```rust
+use branded_index::{ValidIndices, scope};
+
+struct Lookup {
+    idx: ValidIndices<u32>, // validated once, at construction
+}
+
+fn sum(lookup: &Lookup, data: &[f64]) -> f64 {
+    scope(data, |d| {
+        let idx = lookup.idx.view(d.len()).unwrap(); // one comparison
+        idx.iter().map(|&i| d[i]).sum()              // zero bounds checks
+    })
+}
+```
+
+`no_std` (needs `alloc`). MSRV 1.85.
 
 ## How it works
 
@@ -28,31 +52,54 @@ with another brand, or smuggled out of the closure.
 | `Offsets<'id, '_>` | non-decreasing, all `<= n` (CSR `row_ptr`, ragged arrays) | `Len::offsets` |
 | `Slice<'id, '_, T>` / `SliceMut` | length exactly `n` | `Len::brand`, `brand_mut` |
 | `Grid<'id>` | row-major, `width * height == n` | `Len::grid` |
+| `ValidIndices<I>` | owned, every element `< bound`; no brand in its type | `ValidIndices::new`, `from_branded`; `view(len)` re-brands if `len >= bound` |
+| `ValidOffsets` | owned, non-decreasing, all `<= bound` | `ValidOffsets::new`; `view(len)` gives `Offsets<'id, '_>` |
 | `Interior<'id, R>` | at least `R` cells from every edge; `at::<DR, DC>()` reaches any neighbour with `\|DR\|, \|DC\| <= R`, bound checked at compile time | `Grid::interior_rows::<R>()` |
 
 Indexing a `Slice<'id>` with an `Index<'id>` or `Range<'id>` compiles to a plain load. Mixing
 brands, or letting an index escape its scope, is a compile error. The `compile_fail` doctests in
 `src/lib.rs` check both.
 
-## Verification
+### Building your own validated types
 
-- `cargo test`: unit tests, plus kernel tests asserting all variants produce identical output.
-- `cargo +nightly miri test --lib`: clean.
-- Disassembly: the `branded` kernels contain no panic calls. The `checked` ones contain 1 to 6.
+`ValidIndices` and `ValidOffsets` are building blocks: compose them in a struct with private
+fields, validate in the constructor, and re-brand in each method. The benchmark crate's
+`spmv::ValidCsr` is a complete example: a CSR matrix that is checked once in `new` and then
+multiplied any number of times. It has no brand lifetime in its type and no `unsafe` in its
+implementation.
+
+## Repository layout
+
+- `src/lib.rs`: the crate.
+- `bench/`: `branded-index-bench`, an unpublished workspace crate with the benchmark kernels
+  (checked, idiomatic, `unsafe` unchecked and branded variants), their tests, and the criterion
+  benchmarks.
+- `ci/check_no_panics.py`: disassembles the branded kernels and fails if any contains a `call`,
+  which is how a bounds-check panic would show up.
+
+## Verification (all run in CI)
+
+- `cargo test --workspace`: unit tests, compile-fail doctests, plus kernel tests asserting all
+  variants produce identical output.
+- `cargo +1.85 test -p branded-index`: MSRV.
+- `cargo +nightly miri test -p branded-index`: clean.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`.
+- `python3 ci/check_no_panics.py`: the branded kernels contain no panic calls. The `checked`
+  ones contain 1 to 6.
 
 ## Benchmarks
 
-`cargo bench`. AMD Threadripper PRO 9975WX, rustc 1.100, `codegen-units = 1`. Median times.
+`cargo bench -p branded-index-bench`. AMD Threadripper PRO 9975WX, rustc 1.100, `codegen-units = 1`. Median times.
 "Small" fits in L1/L2; "large" spills to DRAM.
 
 | Kernel | checked | best safe w/o crate | `unchecked` (unsafe) | **branded** | validate (once) |
 |---|---|---|---|---|---|
 | add, small (1K) | 63.3 ns | 61.7 ns (zip) | 61.9 ns | 62.1 ns | n/a |
 | add, large (1M) | 102 µs | 102 µs | 102 µs | 102 µs | n/a |
-| gather, small (64K from 1K) | 12.6 µs | n/a | 11.6 µs | 11.5 µs | 19.6 µs |
-| gather, large (64K from 1M) | 28.7 µs | n/a | 29.9 µs | 29.5 µs | 19.8 µs |
-| SpMV, small (1K², 16/row) | 4.6–6.3 µs | 4.1–4.7 µs | 3.48 µs | **3.54 µs** | 6.9 µs |
-| SpMV, large (64K², 16/row) | 404–426 µs | 341–374 µs | 325 µs | **328 µs** | 411 µs |
+| gather, small (64K from 1K) | 12.6 µs | n/a | 11.6 µs | 11.5 µs | 12.2 µs |
+| gather, large (64K from 1M) | 28.7 µs | n/a | 29.9 µs | 29.5 µs | 12.2 µs |
+| SpMV, small (1K², 16/row) | 4.6–6.3 µs | 4.1–4.7 µs | 3.48 µs | **3.54 µs** | 4.9 µs |
+| SpMV, large (64K², 16/row) | 404–426 µs | 341–374 µs | 325 µs | **328 µs** | 389 µs |
 | union-find, small (4K) | 14.8 µs | n/a | 14.0 µs | 14.2 µs | 2.4 µs |
 | union-find, large (1M) | 16.6 ms | n/a | 16.9 ms | 16.1 ms | 0.49 ms |
 | 5-point stencil, small (64²) | 1.19 µs | 0.97 µs | 1.10 µs | 1.10 µs | n/a |
@@ -76,8 +123,8 @@ change. `unchecked` and `branded` stayed stable.
    sub-slices plus `zip`) still pays for `x[col]` on every element. No local rewrite removes it,
    because the proof that `col < x.len()` comes from validating the matrix, not from the loop.
    Branding carries that proof in the type.
-5. **Validation has to be amortized.** A separate validation pass costs more than one checked
-   run. Break-even is about 5 reuses for SpMV, about 4 for union-find, and about 19 for gather.
+5. **Validation has to be amortized.** A separate validation pass costs about as much as one checked
+   run. Break-even is about 4 reuses for SpMV and union-find, and about 12 for gather.
    For data used once, plain checked code is the right call. Branding pays off for structures
    validated once and used many times: iterative solvers, graphs, permutations, embedding
    tables.
@@ -98,7 +145,7 @@ change. `unchecked` and `branded` stayed stable.
    The `large` native row is DRAM-bound and favours the checked/idiomatic loop shapes, probably
    through prefetch behaviour. It shows the same "layout over checks" theme.
 
-### Reassociated SpMV (opt-in, `kernels::spmv::branded_reassoc::<K>`)
+### Reassociated SpMV (opt-in, `branded_index_bench::spmv::branded_reassoc::<K>`)
 
 Each row's sum is split into `K` independent running sums, so the additions run as `K` parallel
 chains instead of one serial chain. This is safe, stable Rust, and gets what `-ffast-math` would
@@ -122,7 +169,7 @@ give C. Results differ from the serial sum in the last bits (tested to within `1
 - **The fixed-`K` choice is a trap under `target-cpu=native`**, which is exactly the flag people
   reach for when they want speed.
 
-### Adaptive SpMV (`kernels::spmv::branded_adaptive`), the robust choice
+### Adaptive SpMV (`branded_index_bench::spmv::branded_adaptive`), the robust choice
 
 Per row: 4 running sums when the row has at least `ADAPTIVE_MIN_ROW` (32) nonzeros, otherwise
 the serial branded index loop. Short rows keep the exact serial result.
@@ -144,8 +191,8 @@ the serial branded index loop. Short rows keep the exact serial result.
 
 ## Limits
 
-- Brands are closure-scoped, so validated structures cannot be stored in a long-lived struct
-  without threading `'id` through it.
+- Branded values (`Index<'id>`, `Slice<'id>`) are closure-scoped. Persist validated data as
+  `ValidIndices` / `ValidOffsets` (or your own type built from them) and re-brand per use.
 - Arbitrary index arithmetic (`i + k`) still needs a fresh check. Only fixed grid offsets
   within the interior margin are free.
 - A language feature (pattern types or refinement types) could make this ergonomic. This crate
