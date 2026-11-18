@@ -1,0 +1,1053 @@
+//! # branded-index
+//!
+//! Bounds checks paid once, at validation, instead of on every access.
+//!
+//! [`with_len`] creates a fresh, unnameable lifetime `'id` (a *brand*) tied to one length `n`.
+//! Every [`Index<'id>`] is proven `< n` when it is created, and every [`Slice<'id, '_, T>`] is
+//! proven to have length exactly `n`. Indexing a branded slice with a branded index therefore
+//! needs no runtime check, and using an index of one brand on a slice of another is a compile
+//! error. The only `unsafe` lives inside this crate; user code stays safe.
+//!
+//! ```
+//! let data = [10, 20, 30, 40];
+//! let total = branded_index::scope(&data, |s| s.len().indices().map(|i| s[i]).sum::<i32>());
+//! assert_eq!(total, 100);
+//! ```
+//!
+//! Indices validated once can be reused any number of times without further checks:
+//!
+//! ```
+//! let data = [1.0, 2.0, 3.0];
+//! let raw = [2u32, 0, 1, 2];
+//! branded_index::scope(&data, |s| {
+//!     let idx: Vec<_> = raw.iter().map(|&i| s.len().check_as(i).unwrap()).collect();
+//!     for _ in 0..3 {
+//!         let sum: f64 = idx.iter().map(|&i| s[i]).sum(); // no bounds checks
+//!         assert_eq!(sum, 9.0);
+//!     }
+//! });
+//! ```
+//!
+//! Several slices can share a brand when their lengths match, so one index works for all of them:
+//!
+//! ```
+//! let (a, b) = ([1, 2, 3], [4, 5, 6]);
+//! let mut c = [0; 3];
+//! branded_index::with_len(3, |n| {
+//!     let (a, b) = (n.brand(&a).unwrap(), n.brand(&b).unwrap());
+//!     let mut c = n.brand_mut(&mut c).unwrap();
+//!     for i in n.indices() {
+//!         c[i] = a[i] + b[i];
+//!     }
+//! });
+//! assert_eq!(c, [5, 7, 9]);
+//! ```
+//!
+//! ## What the compiler rejects
+//!
+//! An index of one brand cannot index a slice of another brand, even if the lengths are equal:
+//!
+//! ```compile_fail,E0521
+//! let (a, b) = ([1, 2, 3], [4, 5, 6]);
+//! branded_index::scope(&a, |a| {
+//!     branded_index::scope(&b, |b| {
+//!         let i = a.len().check(2).unwrap();
+//!         b[i]
+//!     })
+//! });
+//! ```
+//!
+//! An index cannot escape the scope that created it:
+//!
+//! ```compile_fail
+//! let i = branded_index::with_len(3, |n| n.check(0).unwrap());
+//! ```
+//!
+//! Nor can it be smuggled out through captured storage:
+//!
+//! ```compile_fail,E0521
+//! let mut out: Vec<branded_index::Index<'static>> = Vec::new();
+//! branded_index::with_len(3, |n| out.push(n.check(0).unwrap()));
+//! ```
+
+#![no_std]
+#![deny(unsafe_op_in_unsafe_fn, missing_docs)]
+
+extern crate alloc;
+
+use core::fmt;
+use core::hash::Hash;
+use core::iter::FusedIterator;
+use core::marker::PhantomData;
+use core::ops;
+
+#[doc(hidden)]
+pub mod kernels;
+
+/// Invariant lifetime marker. Invariance stops the compiler from shrinking or growing `'id` to
+/// unify two different brands, so each brand stays distinct.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct Brand<'id>(PhantomData<fn(&'id ()) -> &'id ()>);
+
+impl Brand<'_> {
+    #[inline(always)]
+    const fn new() -> Self {
+        Brand(PhantomData)
+    }
+}
+
+/// Opens a scope with a fresh brand `'id` for the length `n`.
+///
+/// The closure must work for *every* lifetime `'id`, so it cannot name the brand, return
+/// anything carrying it, or store branded values anywhere outside the closure.
+#[inline(always)]
+pub fn with_len<R>(n: usize, f: impl for<'id> FnOnce(Len<'id>) -> R) -> R {
+    f(Len { n, brand: Brand::new() })
+}
+
+/// Brands `slice` and runs `f` with it. Shorthand for [`with_len`] plus [`Len::brand`].
+#[inline(always)]
+pub fn scope<'a, T, R>(slice: &'a [T], f: impl for<'id> FnOnce(Slice<'id, 'a, T>) -> R) -> R {
+    f(Slice { s: slice, brand: Brand::new() })
+}
+
+/// Mutable counterpart of [`scope`].
+#[inline(always)]
+pub fn scope_mut<'a, T, R>(
+    slice: &'a mut [T],
+    f: impl for<'id> FnOnce(SliceMut<'id, 'a, T>) -> R,
+) -> R {
+    f(SliceMut { s: slice, brand: Brand::new() })
+}
+
+// ---------------------------------------------------------------------------------------------
+// Len
+// ---------------------------------------------------------------------------------------------
+
+/// A length `n`, carrying the brand `'id`. Everything else in the crate is validated against it.
+#[derive(Clone, Copy)]
+pub struct Len<'id> {
+    n: usize,
+    brand: Brand<'id>,
+}
+
+impl<'id> Len<'id> {
+    /// The length as a plain number.
+    #[inline(always)]
+    pub fn get(self) -> usize {
+        self.n
+    }
+
+    /// `true` when the length is zero, in which case no [`Index<'id>`] can exist.
+    #[inline(always)]
+    pub fn is_empty(self) -> bool {
+        self.n == 0
+    }
+
+    /// Validates `i < n`. This is the one bounds check an index ever pays.
+    #[inline(always)]
+    pub fn check(self, i: usize) -> Option<Index<'id>> {
+        (i < self.n).then_some(Index { raw: i, brand: self.brand })
+    }
+
+    /// Like [`check`](Self::check), but keeps a compact representation (for example `u32`), so
+    /// arrays of indices use less memory.
+    #[inline(always)]
+    pub fn check_as<I: Repr>(self, i: I) -> Option<Index<'id, I>> {
+        match i.try_to_usize() {
+            Some(u) if u < self.n => Some(Index { raw: i, brand: self.brand }),
+            _ => None,
+        }
+    }
+
+    /// Iterates over every index `0..n`. No per-element checks.
+    #[inline(always)]
+    pub fn indices(self) -> Range<'id> {
+        Range { start: 0, end: self.n, brand: self.brand }
+    }
+
+    /// Iterates over every index `0..n` in the compact representation `I`. Returns `None` when
+    /// `n - 1` does not fit in `I`; that single check covers every index produced.
+    #[inline]
+    pub fn indices_as<I: Repr>(
+        self,
+    ) -> Option<impl DoubleEndedIterator<Item = Index<'id, I>> + ExactSizeIterator> {
+        let fits = self.n == 0 || I::try_from_usize(self.n - 1).is_some();
+        // `narrow` is lossless here: every value is `< n` and `n - 1` fits in `I`.
+        fits.then(|| {
+            self.indices()
+                .map(|i| Index { raw: I::narrow(i.raw), brand: i.brand })
+        })
+    }
+
+    /// Validates `start <= end <= n` and returns the branded range.
+    #[inline(always)]
+    pub fn range(self, start: usize, end: usize) -> Option<Range<'id>> {
+        (start <= end && end <= self.n).then_some(Range { start, end, brand: self.brand })
+    }
+
+    /// Validates fenceposts: `s` must be non-decreasing with every element `<= n`. Each adjacent
+    /// pair is then a valid [`Range<'id>`] (CSR row pointers, ragged arrays, string tables),
+    /// and the offsets stay in their compact form, one `usize` per boundary.
+    #[inline]
+    pub fn offsets<'a>(self, s: &'a [usize]) -> Option<Offsets<'id, 'a>> {
+        let sorted = s.windows(2).all(|w| w[0] <= w[1]);
+        let in_range = s.last().is_none_or(|&e| e <= self.n);
+        (sorted && in_range).then_some(Offsets { s, brand: self.brand })
+    }
+
+    /// Views the `n` elements as a row-major grid `width` wide. Requires `width > 0` and `n` a
+    /// multiple of `width`.
+    #[inline(always)]
+    pub fn grid(self, width: usize) -> Option<Grid<'id>> {
+        (width > 0 && self.n.is_multiple_of(width))
+            .then(|| Grid { w: width, h: self.n / width, brand: self.brand })
+    }
+
+    /// Brands `s` if its length is exactly `n`.
+    #[inline(always)]
+    pub fn brand<'a, T>(self, s: &'a [T]) -> Option<Slice<'id, 'a, T>> {
+        (s.len() == self.n).then_some(Slice { s, brand: self.brand })
+    }
+
+    /// Brands `s` mutably if its length is exactly `n`.
+    #[inline(always)]
+    pub fn brand_mut<'a, T>(self, s: &'a mut [T]) -> Option<SliceMut<'id, 'a, T>> {
+        if s.len() == self.n {
+            Some(SliceMut { s, brand: self.brand })
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Debug for Len<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Len({})", self.n)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Index representation
+// ---------------------------------------------------------------------------------------------
+
+mod sealed {
+    pub trait Sealed {}
+}
+
+/// Integer types an [`Index`] can be stored as. Sealed: implemented for `u8`, `u16`, `u32`,
+/// `u64` and `usize`.
+pub trait Repr: sealed::Sealed + Copy + Eq + Ord + Hash + fmt::Debug {
+    #[doc(hidden)]
+    fn try_to_usize(self) -> Option<usize>;
+    #[doc(hidden)]
+    fn try_from_usize(u: usize) -> Option<Self>;
+    /// Widening cast. Lossless for every value this crate validated, because validation proved
+    /// the value is `< n <= usize::MAX`.
+    #[doc(hidden)]
+    fn widen(self) -> usize;
+    /// Narrowing cast. Only called after proving the value fits.
+    #[doc(hidden)]
+    fn narrow(u: usize) -> Self;
+}
+
+macro_rules! impl_repr {
+    ($($t:ty),*) => {$(
+        impl sealed::Sealed for $t {}
+        impl Repr for $t {
+            #[inline(always)]
+            fn try_to_usize(self) -> Option<usize> { usize::try_from(self).ok() }
+            #[inline(always)]
+            fn try_from_usize(u: usize) -> Option<Self> { <$t>::try_from(u).ok() }
+            #[inline(always)]
+            fn widen(self) -> usize { self as usize }
+            #[inline(always)]
+            fn narrow(u: usize) -> Self { u as $t }
+        }
+    )*};
+}
+impl_repr!(u8, u16, u32, u64, usize);
+
+// ---------------------------------------------------------------------------------------------
+// Index
+// ---------------------------------------------------------------------------------------------
+
+/// An index proven to be `< n` for the [`Len<'id>`] of the same brand.
+///
+/// `I` is the stored integer type; `Index<'id, u32>` is 4 bytes.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[repr(transparent)]
+pub struct Index<'id, I: Repr = usize> {
+    raw: I,
+    brand: Brand<'id>,
+}
+
+impl<'id, I: Repr> Index<'id, I> {
+    /// The index as a `usize`.
+    #[inline(always)]
+    pub fn get(self) -> usize {
+        self.raw.widen()
+    }
+
+    /// The index in its stored representation.
+    #[inline(always)]
+    pub fn raw(self) -> I {
+        self.raw
+    }
+
+    /// Converts to another representation, checking that the value fits.
+    #[inline(always)]
+    pub fn to_repr<J: Repr>(self) -> Option<Index<'id, J>> {
+        J::try_from_usize(self.get()).map(|raw| Index { raw, brand: self.brand })
+    }
+}
+
+impl<I: Repr> fmt::Debug for Index<'_, I> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Index({:?})", self.raw)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Range
+// ---------------------------------------------------------------------------------------------
+
+/// A range `start..end` with `start <= end <= n`. Iterates as [`Index<'id>`], and slices a
+/// branded slice without a check.
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub struct Range<'id> {
+    start: usize,
+    end: usize,
+    brand: Brand<'id>,
+}
+
+impl<'id> Range<'id> {
+    /// Lower bound (inclusive).
+    #[inline(always)]
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Upper bound (exclusive).
+    #[inline(always)]
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// Number of indices remaining.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// `true` when no indices remain.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.start == self.end
+    }
+}
+
+impl<'id> Iterator for Range<'id> {
+    type Item = Index<'id>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Index<'id>> {
+        if self.start < self.end {
+            let raw = self.start;
+            self.start += 1;
+            Some(Index { raw, brand: self.brand })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.len(), Some(self.len()))
+    }
+}
+
+impl DoubleEndedIterator for Range<'_> {
+    #[inline(always)]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.start < self.end {
+            self.end -= 1;
+            Some(Index { raw: self.end, brand: self.brand })
+        } else {
+            None
+        }
+    }
+}
+
+impl ExactSizeIterator for Range<'_> {}
+impl FusedIterator for Range<'_> {}
+
+impl fmt::Debug for Range<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Range({}..{})", self.start, self.end)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Offsets
+// ---------------------------------------------------------------------------------------------
+
+/// Non-decreasing offsets, each `<= n`, borrowed from the caller. Created by [`Len::offsets`].
+///
+/// The shared borrow keeps the offsets from changing after validation.
+pub struct Offsets<'id, 'a> {
+    s: &'a [usize],
+    brand: Brand<'id>,
+}
+
+impl Clone for Offsets<'_, '_> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl Copy for Offsets<'_, '_> {}
+
+impl<'id, 'a> Offsets<'id, 'a> {
+    /// The validated offsets.
+    #[inline(always)]
+    pub fn as_slice(self) -> &'a [usize] {
+        self.s
+    }
+
+    /// Ranges between adjacent offsets: `s[0]..s[1]`, `s[1]..s[2]`, and so on.
+    #[inline(always)]
+    pub fn ranges(self) -> Ranges<'id, 'a> {
+        let (prev, rest) = match self.s.split_first() {
+            Some((&first, rest)) => (first, rest),
+            None => (0, &[][..]),
+        };
+        Ranges { prev, rest: rest.iter(), brand: self.brand }
+    }
+}
+
+/// Iterator over the ranges between adjacent [`Offsets`].
+///
+/// Carries the previous boundary in a register, so each step loads one offset, not two.
+#[derive(Clone)]
+pub struct Ranges<'id, 'a> {
+    prev: usize,
+    rest: core::slice::Iter<'a, usize>,
+    brand: Brand<'id>,
+}
+
+impl<'id> Iterator for Ranges<'id, '_> {
+    type Item = Range<'id>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Range<'id>> {
+        let &end = self.rest.next()?;
+        // Validated by `Len::offsets`: adjacent offsets satisfy `prev <= end <= n`.
+        let r = Range { start: self.prev, end, brand: self.brand };
+        self.prev = end;
+        Some(r)
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.rest.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for Ranges<'_, '_> {
+    #[inline(always)]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        let &end = self.rest.next_back()?;
+        let start = self.rest.as_slice().last().copied().unwrap_or(self.prev);
+        Some(Range { start, end, brand: self.brand })
+    }
+}
+
+impl ExactSizeIterator for Ranges<'_, '_> {}
+impl FusedIterator for Ranges<'_, '_> {}
+
+impl fmt::Debug for Offsets<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("Offsets").field(&self.s).finish()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Grid
+// ---------------------------------------------------------------------------------------------
+
+/// The `n` elements of brand `'id` viewed as a row-major `height x width` grid.
+/// Created by [`Len::grid`]; `width * height == n` exactly.
+#[derive(Clone, Copy)]
+pub struct Grid<'id> {
+    w: usize,
+    h: usize,
+    brand: Brand<'id>,
+}
+
+impl<'id> Grid<'id> {
+    /// Number of columns.
+    #[inline(always)]
+    pub fn width(self) -> usize {
+        self.w
+    }
+
+    /// Number of rows.
+    #[inline(always)]
+    pub fn height(self) -> usize {
+        self.h
+    }
+
+    /// The branded length `width * height`.
+    #[inline(always)]
+    pub fn len(self) -> Len<'id> {
+        Len { n: self.w * self.h, brand: self.brand }
+    }
+
+    /// Index of cell (`row`, `col`), checked.
+    #[inline(always)]
+    pub fn at(self, row: usize, col: usize) -> Option<Index<'id>> {
+        // `row * w + col < h * w == n`, so no overflow.
+        (row < self.h && col < self.w).then(|| Index { raw: row * self.w + col, brand: self.brand })
+    }
+
+    /// The interior cells at distance `>= R` from every edge, one row at a time. Every cell
+    /// produced can reach all neighbours within `R` rows and `R` columns without a check.
+    /// Empty when the grid is narrower or shorter than `2 * R + 1`.
+    #[inline(always)]
+    pub fn interior_rows<const R: usize>(self) -> InteriorRows<'id, R> {
+        let fits = R.checked_mul(2).is_some_and(|d| self.w > d && self.h > d);
+        let (row, row_end) = if fits { (R, self.h - R) } else { (0, 0) };
+        InteriorRows { row, row_end, w: self.w, brand: self.brand }
+    }
+}
+
+impl fmt::Debug for Grid<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Grid({}x{})", self.h, self.w)
+    }
+}
+
+/// A grid cell with at least `R` cells of margin on every side. Created by
+/// [`Grid::interior_rows`].
+///
+/// Invariant: `raw == row * w + col` with `R <= row < h - R` and `R <= col < w - R`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Interior<'id, const R: usize> {
+    raw: usize,
+    w: usize,
+    brand: Brand<'id>,
+}
+
+impl<'id, const R: usize> Interior<'id, R> {
+    /// The cell itself.
+    #[inline(always)]
+    pub fn center(self) -> Index<'id> {
+        Index { raw: self.raw, brand: self.brand }
+    }
+
+    /// The cell `DR` rows and `DC` columns away. `|DR|` and `|DC|` must be `<= R`; this is
+    /// checked at compile time, so the access itself needs no runtime check.
+    ///
+    /// ```compile_fail,E0080
+    /// branded_index::with_len(25, |n| {
+    ///     let g = n.grid(5).unwrap();
+    ///     for row in g.interior_rows::<1>() {
+    ///         for i in row {
+    ///             let _ = i.at::<2, 0>(); // two rows away, but the margin is only 1
+    ///         }
+    ///     }
+    /// });
+    /// ```
+    #[inline(always)]
+    pub fn at<const DR: isize, const DC: isize>(self) -> Index<'id> {
+        const {
+            assert!(
+                DR.unsigned_abs() <= R && DC.unsigned_abs() <= R,
+                "stencil offset exceeds the interior margin R"
+            )
+        };
+        // The target is `(row + DR) * w + (col + DC)`. With `|DR|, |DC| <= R` and the invariant,
+        // `0 <= row + DR < h` and `0 <= col + DC < w`, so the true value lies in `0..n`.
+        // Wrapping arithmetic computes it modulo 2^usize::BITS, which is then exact.
+        let offset = (DR as usize).wrapping_mul(self.w).wrapping_add(DC as usize);
+        Index { raw: self.raw.wrapping_add(offset), brand: self.brand }
+    }
+
+    /// One row up. Needs `R >= 1`.
+    #[inline(always)]
+    pub fn up(self) -> Index<'id> {
+        self.at::<-1, 0>()
+    }
+
+    /// One row down. Needs `R >= 1`.
+    #[inline(always)]
+    pub fn down(self) -> Index<'id> {
+        self.at::<1, 0>()
+    }
+
+    /// One column left. Needs `R >= 1`.
+    #[inline(always)]
+    pub fn left(self) -> Index<'id> {
+        self.at::<0, -1>()
+    }
+
+    /// One column right. Needs `R >= 1`.
+    #[inline(always)]
+    pub fn right(self) -> Index<'id> {
+        self.at::<0, 1>()
+    }
+
+    /// Row of the cell.
+    #[inline(always)]
+    pub fn row(self) -> usize {
+        self.raw / self.w
+    }
+
+    /// Column of the cell.
+    #[inline(always)]
+    pub fn col(self) -> usize {
+        self.raw % self.w
+    }
+}
+
+impl<const R: usize> fmt::Debug for Interior<'_, R> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Interior<{R}>({}, {})", self.row(), self.col())
+    }
+}
+
+/// Iterator over interior rows; see [`Grid::interior_rows`].
+#[derive(Clone)]
+pub struct InteriorRows<'id, const R: usize> {
+    row: usize,
+    row_end: usize,
+    w: usize,
+    brand: Brand<'id>,
+}
+
+impl<'id, const R: usize> Iterator for InteriorRows<'id, R> {
+    type Item = InteriorRow<'id, R>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<InteriorRow<'id, R>> {
+        if self.row < self.row_end {
+            // Nonempty only if `w > 2R` (checked in `interior_rows`), so `R < w - R`.
+            let base = self.row * self.w;
+            self.row += 1;
+            Some(InteriorRow {
+                cur: base + R,
+                end: base + self.w - R,
+                w: self.w,
+                brand: self.brand,
+            })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.row_end - self.row;
+        (n, Some(n))
+    }
+}
+
+impl<const R: usize> ExactSizeIterator for InteriorRows<'_, R> {}
+impl<const R: usize> FusedIterator for InteriorRows<'_, R> {}
+
+/// The interior cells of one row; see [`Grid::interior_rows`].
+#[derive(Clone)]
+pub struct InteriorRow<'id, const R: usize> {
+    cur: usize,
+    end: usize,
+    w: usize,
+    brand: Brand<'id>,
+}
+
+impl<'id, const R: usize> Iterator for InteriorRow<'id, R> {
+    type Item = Interior<'id, R>;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<Interior<'id, R>> {
+        if self.cur < self.end {
+            let raw = self.cur;
+            self.cur += 1;
+            Some(Interior { raw, w: self.w, brand: self.brand })
+        } else {
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.end - self.cur;
+        (n, Some(n))
+    }
+}
+
+impl<const R: usize> DoubleEndedIterator for InteriorRow<'_, R> {
+    #[inline(always)]
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.cur < self.end {
+            self.end -= 1;
+            Some(Interior { raw: self.end, w: self.w, brand: self.brand })
+        } else {
+            None
+        }
+    }
+}
+
+impl<const R: usize> ExactSizeIterator for InteriorRow<'_, R> {}
+impl<const R: usize> FusedIterator for InteriorRow<'_, R> {}
+
+// ---------------------------------------------------------------------------------------------
+// Slice / SliceMut
+// ---------------------------------------------------------------------------------------------
+
+/// A shared slice proven to have length exactly `n` for brand `'id`.
+pub struct Slice<'id, 'a, T> {
+    s: &'a [T],
+    brand: Brand<'id>,
+}
+
+impl<T> Clone for Slice<'_, '_, T> {
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<T> Copy for Slice<'_, '_, T> {}
+
+impl<'id, 'a, T> Slice<'id, 'a, T> {
+    /// The branded length.
+    #[inline(always)]
+    pub fn len(self) -> Len<'id> {
+        Len { n: self.s.len(), brand: self.brand }
+    }
+
+    /// The underlying slice.
+    #[inline(always)]
+    pub fn as_slice(self) -> &'a [T] {
+        self.s
+    }
+
+    /// Element at `i`, with the lifetime of the underlying slice. Never checks.
+    #[inline(always)]
+    pub fn get<I: Repr>(self, i: Index<'id, I>) -> &'a T {
+        // SAFETY: `i` was validated `< n` against the `Len<'id>` of this brand (`Len::check*`,
+        // `Range` iteration), and this slice was validated to have length exactly `n` for the
+        // same brand (`Len::brand`, `scope`). Brands are invariant and unique per scope, so
+        // both facts refer to the same `n`. Hence `i < self.s.len()`.
+        unsafe { self.s.get_unchecked(i.get()) }
+    }
+
+    /// Sub-slice for `r`. Never checks.
+    #[inline(always)]
+    pub fn slice(self, r: Range<'id>) -> &'a [T] {
+        // SAFETY: `r.start <= r.end <= n` (validated by `Len::range` or derived from
+        // `Len::indices`), and `self.s.len() == n` for the same brand.
+        unsafe { self.s.get_unchecked(r.start..r.end) }
+    }
+}
+
+impl<'id, T, I: Repr> ops::Index<Index<'id, I>> for Slice<'id, '_, T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: Index<'id, I>) -> &T {
+        self.get(i)
+    }
+}
+
+impl<'id, T> ops::Index<Range<'id>> for Slice<'id, '_, T> {
+    type Output = [T];
+    #[inline(always)]
+    fn index(&self, r: Range<'id>) -> &[T] {
+        self.slice(r)
+    }
+}
+
+/// A mutable slice proven to have length exactly `n` for brand `'id`.
+///
+/// Handing out `&mut [T]` is fine: a slice's length cannot change through it.
+pub struct SliceMut<'id, 'a, T> {
+    s: &'a mut [T],
+    brand: Brand<'id>,
+}
+
+impl<'id, 'a, T> SliceMut<'id, 'a, T> {
+    /// The branded length.
+    #[inline(always)]
+    pub fn len(&self) -> Len<'id> {
+        Len { n: self.s.len(), brand: self.brand }
+    }
+
+    /// The underlying slice, shared.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[T] {
+        self.s
+    }
+
+    /// The underlying slice, mutable.
+    #[inline(always)]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        self.s
+    }
+
+    /// A shorter-lived branded view, so the slice can be passed on and used again afterwards.
+    #[inline(always)]
+    pub fn reborrow(&mut self) -> SliceMut<'id, '_, T> {
+        SliceMut { s: self.s, brand: self.brand }
+    }
+
+    /// A shared branded view.
+    #[inline(always)]
+    pub fn as_shared(&self) -> Slice<'id, '_, T> {
+        Slice { s: self.s, brand: self.brand }
+    }
+
+    /// Mutable element at `i`. Never checks.
+    #[inline(always)]
+    pub fn get_mut<I: Repr>(&mut self, i: Index<'id, I>) -> &mut T {
+        // SAFETY: same argument as `Slice::get`: `i < n == self.s.len()`.
+        unsafe { self.s.get_unchecked_mut(i.get()) }
+    }
+
+    /// Mutable sub-slice for `r`. Never checks.
+    #[inline(always)]
+    pub fn slice_mut(&mut self, r: Range<'id>) -> &mut [T] {
+        // SAFETY: same argument as `Slice::slice`: `r.start <= r.end <= n == self.s.len()`.
+        unsafe { self.s.get_unchecked_mut(r.start..r.end) }
+    }
+
+    /// Swaps two elements. Never checks.
+    #[inline(always)]
+    pub fn swap<I: Repr>(&mut self, a: Index<'id, I>, b: Index<'id, I>) {
+        let p = self.s.as_mut_ptr();
+        // SAFETY: both indices are `< n == self.s.len()`, so both pointers are in bounds of the
+        // same allocation. `ptr::swap` allows `a == b` (overlapping).
+        unsafe { core::ptr::swap(p.add(a.get()), p.add(b.get())) }
+    }
+}
+
+impl<'id, T, I: Repr> ops::Index<Index<'id, I>> for SliceMut<'id, '_, T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: Index<'id, I>) -> &T {
+        // SAFETY: `i < n == self.s.len()`, see `Slice::get`.
+        unsafe { self.s.get_unchecked(i.get()) }
+    }
+}
+
+impl<'id, T, I: Repr> ops::IndexMut<Index<'id, I>> for SliceMut<'id, '_, T> {
+    #[inline(always)]
+    fn index_mut(&mut self, i: Index<'id, I>) -> &mut T {
+        self.get_mut(i)
+    }
+}
+
+impl<'id, T> ops::Index<Range<'id>> for SliceMut<'id, '_, T> {
+    type Output = [T];
+    #[inline(always)]
+    fn index(&self, r: Range<'id>) -> &[T] {
+        // SAFETY: `r.start <= r.end <= n == self.s.len()`, see `Slice::slice`.
+        unsafe { self.s.get_unchecked(r.start..r.end) }
+    }
+}
+
+impl<'id, T> ops::IndexMut<Range<'id>> for SliceMut<'id, '_, T> {
+    #[inline(always)]
+    fn index_mut(&mut self, r: Range<'id>) -> &mut [T] {
+        self.slice_mut(r)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+    use alloc::vec::Vec;
+
+    #[test]
+    fn check_boundaries() {
+        with_len(3, |n| {
+            assert_eq!(n.check(0).map(Index::get), Some(0));
+            assert_eq!(n.check(2).map(Index::get), Some(2));
+            assert!(n.check(3).is_none());
+            assert!(n.check(usize::MAX).is_none());
+        });
+        with_len(0, |n| {
+            assert!(n.check(0).is_none());
+            assert_eq!(n.indices().count(), 0);
+        });
+    }
+
+    #[test]
+    fn check_as_boundaries() {
+        with_len(300, |n| {
+            assert!(n.check_as(255u8).is_some());
+            assert!(n.check_as(299u16).is_some());
+            assert!(n.check_as(300u16).is_none());
+            assert!(n.check_as(u64::MAX).is_none());
+        });
+    }
+
+    #[test]
+    fn indices_as_fit() {
+        with_len(256, |n| {
+            let v: Vec<_> = n.indices_as::<u8>().unwrap().map(Index::get).collect();
+            assert_eq!(v.len(), 256);
+            assert_eq!(v[255], 255);
+        });
+        with_len(257, |n| assert!(n.indices_as::<u8>().is_none()));
+        with_len(0, |n| assert_eq!(n.indices_as::<u8>().unwrap().count(), 0));
+    }
+
+    #[test]
+    fn to_repr_checks_fit() {
+        with_len(1000, |n| {
+            assert!(n.check(255).unwrap().to_repr::<u8>().is_some());
+            assert!(n.check(256).unwrap().to_repr::<u8>().is_none());
+        });
+    }
+
+    #[test]
+    fn range_validation() {
+        with_len(5, |n| {
+            assert!(n.range(0, 5).is_some());
+            assert!(n.range(5, 5).is_some());
+            assert!(n.range(3, 2).is_none());
+            assert!(n.range(0, 6).is_none());
+            let r = n.range(1, 4).unwrap();
+            assert_eq!(r.clone().map(Index::get).collect::<Vec<_>>(), [1, 2, 3]);
+            assert_eq!(r.rev().map(Index::get).collect::<Vec<_>>(), [3, 2, 1]);
+        });
+    }
+
+    #[test]
+    fn offsets_validation() {
+        with_len(10, |n| {
+            let o = n.offsets(&[0, 3, 3, 10]).unwrap();
+            let got: Vec<_> = o.ranges().map(|r| (r.start(), r.end())).collect();
+            assert_eq!(got, [(0, 3), (3, 3), (3, 10)]);
+            let back: Vec<_> = o.ranges().rev().map(|r| (r.start(), r.end())).collect();
+            assert_eq!(back, [(3, 10), (3, 3), (0, 3)]);
+            let mut it = o.ranges();
+            assert_eq!(it.len(), 3);
+            assert_eq!(it.next_back().map(|r| r.start()), Some(3));
+            assert_eq!(it.next().map(|r| r.end()), Some(3));
+            assert_eq!(it.next().map(|r| (r.start(), r.end())), Some((3, 3)));
+            assert!(it.next().is_none() && it.next_back().is_none());
+            assert!(n.offsets(&[]).unwrap().ranges().next().is_none());
+            assert!(n.offsets(&[4]).unwrap().ranges().next().is_none());
+            assert!(n.offsets(&[0, 5, 4]).is_none());
+            assert!(n.offsets(&[0, 11]).is_none());
+            assert!(n.offsets(&[11]).is_none());
+        });
+    }
+
+    #[test]
+    fn grid_validation() {
+        with_len(12, |n| {
+            let g = n.grid(4).unwrap();
+            assert_eq!((g.height(), g.width()), (3, 4));
+            assert_eq!(g.at(2, 3).map(Index::get), Some(11));
+            assert!(g.at(3, 0).is_none() && g.at(0, 4).is_none());
+            assert!(n.grid(5).is_none());
+            assert!(n.grid(0).is_none());
+        });
+    }
+
+    #[test]
+    fn interior_cells_and_neighbours() {
+        // 4 rows x 5 cols; radius-1 interior is rows 1..3, cols 1..4.
+        with_len(20, |n| {
+            let g = n.grid(5).unwrap();
+            let cells: Vec<_> = g.interior_rows::<1>().flatten().map(|i| (i.row(), i.col())).collect();
+            assert_eq!(cells, [(1, 1), (1, 2), (1, 3), (2, 1), (2, 2), (2, 3)]);
+            for i in g.interior_rows::<1>().flatten() {
+                let c = i.center().get();
+                assert_eq!(i.up().get(), c - 5);
+                assert_eq!(i.down().get(), c + 5);
+                assert_eq!(i.left().get(), c - 1);
+                assert_eq!(i.right().get(), c + 1);
+                assert_eq!(i.at::<-1, 1>().get(), c - 4);
+                assert_eq!(i.at::<1, -1>().get(), c + 4);
+            }
+            let rev: Vec<_> = g.interior_rows::<1>().next().unwrap().rev().map(|i| i.col()).collect();
+            assert_eq!(rev, [3, 2, 1]);
+        });
+    }
+
+    #[test]
+    fn interior_radius_two_reaches_corners() {
+        with_len(7 * 6, |n| {
+            let g = n.grid(6).unwrap();
+            let cells: Vec<_> = g.interior_rows::<2>().flatten().collect();
+            assert_eq!(cells.len(), 3 * 2);
+            for i in cells {
+                assert!(i.at::<-2, -2>().get() < 42 && i.at::<2, 2>().get() < 42);
+                assert_eq!(i.at::<-2, -2>().get(), i.center().get() - 2 * 6 - 2);
+            }
+        });
+    }
+
+    #[test]
+    fn interior_empty_when_too_small() {
+        with_len(6, |n| {
+            assert_eq!(n.grid(3).unwrap().interior_rows::<1>().count(), 0); // 2 rows
+            assert_eq!(n.grid(2).unwrap().interior_rows::<1>().count(), 0); // 2 cols
+            assert_eq!(n.grid(6).unwrap().interior_rows::<0>().flatten().count(), 6);
+        });
+        with_len(0, |n| assert_eq!(n.grid(1).unwrap().interior_rows::<1>().count(), 0));
+        with_len(9, |n| {
+            let g = n.grid(3).unwrap();
+            assert_eq!(g.interior_rows::<{ usize::MAX }>().count(), 0);
+            assert_eq!(g.interior_rows::<1>().flatten().map(|i| i.center().get()).collect::<Vec<_>>(), [4]);
+        });
+    }
+
+    #[test]
+    fn brand_requires_exact_length() {
+        let v = [1, 2, 3];
+        with_len(3, |n| assert!(n.brand(&v).is_some()));
+        with_len(2, |n| assert!(n.brand(&v).is_none()));
+        with_len(4, |n| assert!(n.brand(&v).is_none()));
+    }
+
+    #[test]
+    fn index_and_slice() {
+        let v = [10, 20, 30, 40, 50];
+        scope(&v, |s| {
+            let i = s.len().check(3).unwrap();
+            assert_eq!(s[i], 40);
+            let r = s.len().range(1, 3).unwrap();
+            assert_eq!(&s[r], &[20, 30]);
+            assert_eq!(s.len().indices().map(|i| s[i]).sum::<i32>(), 150);
+        });
+    }
+
+    #[test]
+    fn mutation() {
+        let mut v = [1, 2, 3, 4];
+        scope_mut(&mut v, |mut s| {
+            let n = s.len();
+            for i in n.indices() {
+                s[i] *= 10;
+            }
+            let (a, b) = (n.check(0).unwrap(), n.check(3).unwrap());
+            s.swap(a, b);
+            s.swap(a, a);
+            let r = n.range(1, 3).unwrap();
+            s[r].reverse();
+        });
+        assert_eq!(v, [40, 30, 20, 10]);
+    }
+
+    #[test]
+    fn compact_index_is_small() {
+        assert_eq!(core::mem::size_of::<Index<'static, u32>>(), 4);
+        assert_eq!(core::mem::size_of::<Index<'static>>(), core::mem::size_of::<usize>());
+        assert_eq!(core::mem::size_of::<Option<Index<'static, u32>>>(), 8);
+    }
+}

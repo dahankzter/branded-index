@@ -1,0 +1,24 @@
+[package]
+name = "branded-index"
+version = "0.1.0"
+edition = "2024"
+description = "Branded indices: pay the bounds check once, at validation, instead of on every access"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/dahankzter/branded-index"
+readme = "README.md"
+keywords = ["bounds-check", "index", "branded", "no-std", "performance"]
+categories = ["no-std", "data-structures", "rust-patterns"]
+exclude = ["/target"]
+
+[dependencies]
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "kernels"
+harness = false
+
+[profile.bench]
+codegen-units = 1
+debug = true
