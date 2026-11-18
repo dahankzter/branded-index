@@ -341,6 +341,36 @@ impl<'id, I: Repr> Index<'id, I> {
     }
 }
 
+impl<'id> Index<'id> {
+    /// The previous index. Never needs a bound: `i - 1 < i < n`.
+    #[inline(always)]
+    pub fn prev(self) -> Option<Index<'id>> {
+        self.checked_sub(1)
+    }
+
+    /// `i - k`, if it does not underflow. Never needs a bound: `i - k <= i < n`.
+    #[inline(always)]
+    pub fn checked_sub(self, k: usize) -> Option<Index<'id>> {
+        self.raw.checked_sub(k).map(|raw| Index {
+            raw,
+            brand: self.brand,
+        })
+    }
+
+    /// The next index, if it is `< n`.
+    #[inline(always)]
+    pub fn next(self, len: Len<'id>) -> Option<Index<'id>> {
+        self.checked_add(1, len)
+    }
+
+    /// `i + k`, if it is `< n`.
+    #[inline(always)]
+    pub fn checked_add(self, k: usize, len: Len<'id>) -> Option<Index<'id>> {
+        // `i < n`, so `i + k` overflows only if `k > usize::MAX - i`; checked_add handles it.
+        self.raw.checked_add(k).and_then(|u| len.check(u))
+    }
+}
+
 impl<I: Repr> fmt::Debug for Index<'_, I> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Index({:?})", self.raw)
@@ -383,6 +413,63 @@ impl<'id> Range<'id> {
     #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.start == self.end
+    }
+
+    /// `true` if `i` lies in `start..end`.
+    #[inline(always)]
+    pub fn contains(&self, i: Index<'id>) -> bool {
+        self.start <= i.raw && i.raw < self.end
+    }
+
+    /// Splits into `start..start + k` and `start + k..end`, if `k <= len`.
+    #[inline(always)]
+    pub fn split_at(self, k: usize) -> Option<(Range<'id>, Range<'id>)> {
+        // `k <= end - start`, so `start <= mid <= end <= n`.
+        (k <= self.len()).then(|| {
+            let mid = self.start + k;
+            let lo = Range {
+                start: self.start,
+                end: mid,
+                brand: self.brand,
+            };
+            (
+                lo,
+                Range {
+                    start: mid,
+                    end: self.end,
+                    brand: self.brand,
+                },
+            )
+        })
+    }
+
+    /// The first index and the rest, if not empty.
+    #[inline(always)]
+    pub fn split_first(self) -> Option<(Index<'id>, Range<'id>)> {
+        let brand = self.brand;
+        let (first, rest) = self.split_at(1)?;
+        Some((
+            Index {
+                raw: first.start,
+                brand,
+            },
+            rest,
+        ))
+    }
+
+    /// The rest and the last index, if not empty.
+    #[inline(always)]
+    pub fn split_last(self) -> Option<(Range<'id>, Index<'id>)> {
+        let brand = self.brand;
+        let k = self.len().checked_sub(1)?;
+        let (rest, last) = self.split_at(k)?;
+        Some((
+            rest,
+            Index {
+                raw: last.start,
+                brand,
+            },
+        ))
     }
 }
 
@@ -729,6 +816,234 @@ impl ValidOffsets {
 }
 
 // ---------------------------------------------------------------------------------------------
+// AppendVec
+// ---------------------------------------------------------------------------------------------
+
+/// Single-use permission to create one [`AppendVec`] for brand `'id`. Not `Clone`: one vector
+/// per brand is what keeps its indices sound.
+pub struct AppendToken<'id> {
+    brand: Brand<'id>,
+}
+
+impl fmt::Debug for AppendToken<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AppendToken")
+    }
+}
+
+/// Opens a scope with a fresh brand for one [`AppendVec`].
+///
+/// A token rather than a ready-made vector lets the element type mention the brand, so
+/// elements can hold indices into their own vector.
+#[inline(always)]
+pub fn append_scope<R>(f: impl for<'id> FnOnce(AppendToken<'id>) -> R) -> R {
+    f(AppendToken {
+        brand: Brand::new(),
+    })
+}
+
+/// A vector that only grows. Every [`Index<'id>`] it hands out stays valid for the rest of the
+/// scope, so elements can refer to each other by index (graphs, arenas, interners) and every
+/// access is check-free.
+///
+/// Nothing removes elements, and no [`Len<'id>`] exists while the vector can still grow:
+/// indices come only from [`push`](Self::push), [`extend`](Self::extend), [`check`](Self::check)
+/// and [`indices`](Self::indices). [`freeze`](Self::freeze) ends growth and returns the final
+/// `Len<'id>`, which connects to the rest of the crate.
+///
+/// ```
+/// use branded_index::{AppendVec, Index, append_scope};
+///
+/// // Edges point at nodes of the same vector.
+/// struct Node<'id> {
+///     name: &'static str,
+///     edges: Vec<Index<'id>>,
+/// }
+///
+/// let names = append_scope(|token| {
+///     let mut g = AppendVec::new(token);
+///     let a = g.push(Node { name: "a", edges: vec![] });
+///     let b = g.push(Node { name: "b", edges: vec![a] });
+///     let c = g.push(Node { name: "c", edges: vec![a, b] });
+///     g[a].edges.push(c); // cycles are fine
+///     g[c].edges.iter().map(|&e| g[e].name).collect::<Vec<_>>() // no bounds checks
+/// });
+/// assert_eq!(names, ["a", "b"]);
+/// ```
+///
+/// The token cannot be duplicated to make a second vector with the same brand:
+///
+/// ```compile_fail,E0382
+/// branded_index::append_scope(|token| {
+///     let mut a = branded_index::AppendVec::new(token);
+///     let mut b = branded_index::AppendVec::new(token);
+///     a.push(1);
+///     b.push(2);
+/// });
+/// ```
+pub struct AppendVec<'id, T> {
+    v: Vec<T>,
+    brand: Brand<'id>,
+}
+
+impl<'id, T> AppendVec<'id, T> {
+    /// An empty vector for the token's brand.
+    #[inline]
+    pub fn new(token: AppendToken<'id>) -> Self {
+        Self::from_vec(token, Vec::new())
+    }
+
+    /// Takes over `v`; its existing elements are reachable through [`indices`](Self::indices).
+    #[inline]
+    pub fn from_vec(token: AppendToken<'id>, v: Vec<T>) -> Self {
+        AppendVec {
+            v,
+            brand: token.brand,
+        }
+    }
+
+    /// Appends `x` and returns its index, valid for the rest of the scope.
+    #[inline]
+    pub fn push(&mut self, x: T) -> Index<'id> {
+        let raw = self.v.len();
+        self.v.push(x);
+        Index {
+            raw,
+            brand: self.brand,
+        }
+    }
+
+    /// Appends every item and returns the range of their indices.
+    pub fn extend(&mut self, items: impl IntoIterator<Item = T>) -> Range<'id> {
+        let start = self.v.len();
+        self.v.extend(items);
+        Range {
+            start,
+            end: self.v.len(),
+            brand: self.brand,
+        }
+    }
+
+    /// Validates `i < len`. Valid forever after, since the length never shrinks.
+    #[inline(always)]
+    pub fn check(&self, i: usize) -> Option<Index<'id>> {
+        (i < self.v.len()).then_some(Index {
+            raw: i,
+            brand: self.brand,
+        })
+    }
+
+    /// All current indices. They stay valid while more elements are pushed.
+    #[inline(always)]
+    pub fn indices(&self) -> Range<'id> {
+        Range {
+            start: 0,
+            end: self.v.len(),
+            brand: self.brand,
+        }
+    }
+
+    /// The index of the last element, if any.
+    #[inline(always)]
+    pub fn last_index(&self) -> Option<Index<'id>> {
+        self.v.len().checked_sub(1).map(|raw| Index {
+            raw,
+            brand: self.brand,
+        })
+    }
+
+    /// Current number of elements.
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        self.v.len()
+    }
+
+    /// `true` when there are no elements yet.
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.v.is_empty()
+    }
+
+    /// Reserves capacity for at least `additional` more elements.
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.v.reserve(additional);
+    }
+
+    /// Element at `i`. Never checks.
+    #[inline(always)]
+    pub fn get<I: Repr>(&self, i: Index<'id, I>) -> &T {
+        // SAFETY: while this vector exists, indices of brand `'id` come only from its own
+        // `push`, `extend`, `check`, `indices` and `last_index`, each `< len` at creation (the
+        // token is consumed, so no second vector and no `Len<'id>` can exist). The length never
+        // decreases: nothing removes elements and no `&mut Vec<T>` is handed out. So
+        // `i < len` now.
+        unsafe { self.v.get_unchecked(i.get()) }
+    }
+
+    /// Mutable element at `i`. Never checks.
+    #[inline(always)]
+    pub fn get_mut<I: Repr>(&mut self, i: Index<'id, I>) -> &mut T {
+        // SAFETY: as in `get`.
+        unsafe { self.v.get_unchecked_mut(i.get()) }
+    }
+
+    /// The elements as a slice.
+    #[inline(always)]
+    pub fn as_slice(&self) -> &[T] {
+        &self.v
+    }
+
+    /// The elements as a mutable slice. Its length cannot change through it.
+    #[inline(always)]
+    pub fn as_mut_slice(&mut self) -> &mut [T] {
+        &mut self.v
+    }
+
+    /// Elements paired with their indices.
+    #[inline(always)]
+    pub fn iter_indexed(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (Index<'id>, &T)> + ExactSizeIterator {
+        self.indices().zip(self.v.iter())
+    }
+
+    /// Ends growth. Returns the final branded length and the elements; every index handed out
+    /// is `< n`, so they work with [`Len::brand`] slices and [`ValidIndices::from_branded`].
+    #[inline]
+    pub fn freeze(self) -> (Len<'id>, Vec<T>) {
+        (
+            Len {
+                n: self.v.len(),
+                brand: self.brand,
+            },
+            self.v,
+        )
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for AppendVec<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("AppendVec").field(&self.v).finish()
+    }
+}
+
+impl<'id, T, I: Repr> ops::Index<Index<'id, I>> for AppendVec<'id, T> {
+    type Output = T;
+    #[inline(always)]
+    fn index(&self, i: Index<'id, I>) -> &T {
+        self.get(i)
+    }
+}
+
+impl<'id, T, I: Repr> ops::IndexMut<Index<'id, I>> for AppendVec<'id, T> {
+    #[inline(always)]
+    fn index_mut(&mut self, i: Index<'id, I>) -> &mut T {
+        self.get_mut(i)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Grid
 // ---------------------------------------------------------------------------------------------
 
@@ -1010,6 +1325,51 @@ impl<'id, 'a, T> Slice<'id, 'a, T> {
         }
     }
 
+    /// Elements paired with their branded indices.
+    #[inline(always)]
+    pub fn iter_indexed(
+        self,
+    ) -> impl DoubleEndedIterator<Item = (Index<'id>, &'a T)> + ExactSizeIterator {
+        self.len().indices().zip(self.s)
+    }
+
+    /// Binary search for `x` in a sorted slice. `Ok` carries a branded index of a match; `Err`
+    /// the insertion point in `0..=n`, as in [`slice::binary_search`].
+    #[inline]
+    pub fn binary_search(self, x: &T) -> Result<Index<'id>, usize>
+    where
+        T: Ord,
+    {
+        self.binary_search_by(|e| e.cmp(x))
+    }
+
+    /// [`binary_search`](Self::binary_search) with a comparator.
+    #[inline]
+    pub fn binary_search_by(
+        self,
+        f: impl FnMut(&'a T) -> core::cmp::Ordering,
+    ) -> Result<Index<'id>, usize> {
+        // One extra comparison after an O(log n) search, instead of trusting std's result for
+        // soundness.
+        let len = self.len();
+        self.s.binary_search_by(f).map(|i| {
+            len.check(i)
+                .expect("binary_search returned an in-bounds index")
+        })
+    }
+
+    /// Splits `0..n` at the first element where `pred` is false, for a slice partitioned by
+    /// `pred` (as in [`slice::partition_point`]). Returns the branded ranges where `pred`
+    /// holds and where it does not.
+    #[inline]
+    pub fn partition_point(self, pred: impl FnMut(&T) -> bool) -> (Range<'id>, Range<'id>) {
+        let p = self.s.partition_point(pred);
+        self.len()
+            .indices()
+            .split_at(p)
+            .expect("partition_point is at most the length")
+    }
+
     /// The underlying slice.
     #[inline(always)]
     pub fn as_slice(self) -> &'a [T] {
@@ -1067,6 +1427,14 @@ impl<'id, 'a, T> SliceMut<'id, 'a, T> {
             n: self.s.len(),
             brand: self.brand,
         }
+    }
+
+    /// Mutable elements paired with their branded indices.
+    #[inline(always)]
+    pub fn iter_indexed_mut(
+        &mut self,
+    ) -> impl DoubleEndedIterator<Item = (Index<'id>, &mut T)> + ExactSizeIterator {
+        self.len().indices().zip(self.s.iter_mut())
     }
 
     /// The underlying slice, shared.
@@ -1387,6 +1755,163 @@ mod tests {
             assert_eq!(r, [(0, 2), (2, 2), (2, 5)]);
         });
         assert_eq!(ValidOffsets::new(Vec::new(), 0).unwrap().ranges_len(), 0);
+    }
+
+    #[test]
+    fn index_arithmetic() {
+        with_len(5, |n| {
+            let (first, last) = (n.check(0).unwrap(), n.check(4).unwrap());
+            assert!(first.prev().is_none());
+            assert_eq!(last.prev().map(Index::get), Some(3));
+            assert_eq!(last.checked_sub(4).map(Index::get), Some(0));
+            assert!(last.checked_sub(5).is_none());
+            assert!(last.next(n).is_none());
+            assert_eq!(first.next(n).map(Index::get), Some(1));
+            assert_eq!(first.checked_add(4, n).map(Index::get), Some(4));
+            assert!(first.checked_add(5, n).is_none());
+            assert!(last.checked_add(usize::MAX, n).is_none());
+        });
+    }
+
+    #[test]
+    fn range_splitting() {
+        with_len(6, |n| {
+            let r = n.range(1, 5).unwrap();
+            assert!(r.contains(n.check(1).unwrap()) && r.contains(n.check(4).unwrap()));
+            assert!(!r.contains(n.check(0).unwrap()) && !r.contains(n.check(5).unwrap()));
+            let (a, b) = r.clone().split_at(3).unwrap();
+            assert_eq!((a.start(), a.end(), b.start(), b.end()), (1, 4, 4, 5));
+            let (a, b) = r.clone().split_at(4).unwrap();
+            assert!(b.is_empty() && a.len() == 4);
+            assert!(r.clone().split_at(5).is_none());
+            let (f, rest) = r.clone().split_first().unwrap();
+            assert_eq!((f.get(), rest.start()), (1, 2));
+            let (rest, l) = r.split_last().unwrap();
+            assert_eq!((rest.end(), l.get()), (4, 4));
+            let empty = n.range(3, 3).unwrap();
+            assert!(empty.clone().split_first().is_none() && empty.split_last().is_none());
+        });
+    }
+
+    #[test]
+    fn search_and_partition() {
+        let v = [1, 3, 3, 7, 9];
+        scope(&v, |s| {
+            assert_eq!(s.binary_search(&7).map(|i| s[i]), Ok(7));
+            assert_eq!(s.binary_search(&4), Err(3));
+            assert_eq!(s.binary_search(&10), Err(5));
+            let (lo, hi) = s.partition_point(|&x| x < 5);
+            assert_eq!(&s[lo], &[1, 3, 3]);
+            assert_eq!(&s[hi], &[7, 9]);
+            let (lo, hi) = s.partition_point(|_| true);
+            assert_eq!((lo.len(), hi.len()), (5, 0));
+        });
+        scope(&[] as &[i32], |s| {
+            assert_eq!(s.binary_search(&1), Err(0));
+            let (lo, hi) = s.partition_point(|_| false);
+            assert!(lo.is_empty() && hi.is_empty());
+        });
+    }
+
+    #[test]
+    fn indexed_iteration() {
+        let mut v = [10, 20, 30];
+        scope_mut(&mut v, |mut s| {
+            for (i, x) in s.iter_indexed_mut() {
+                *x += i.get();
+            }
+            let pairs: Vec<_> = s
+                .as_shared()
+                .iter_indexed()
+                .map(|(i, &x)| (i.get(), x))
+                .collect();
+            assert_eq!(pairs, [(0, 10), (1, 21), (2, 32)]);
+            assert_eq!(
+                s.as_shared()
+                    .iter_indexed()
+                    .next_back()
+                    .map(|(i, _)| i.get()),
+                Some(2)
+            );
+        });
+    }
+
+    #[test]
+    fn append_vec_indices_survive_growth() {
+        append_scope(|token| {
+            let mut v = AppendVec::from_vec(token, alloc::vec![10, 11]);
+            let early = v.indices();
+            let a = v.push(12);
+            let r = v.extend([13, 14, 15]);
+            assert_eq!((r.start(), r.end()), (3, 6));
+            v.reserve(100);
+            for i in 0..1000 {
+                v.push(i); // reallocations do not invalidate indices
+            }
+            assert_eq!(early.map(|i| v[i]).collect::<Vec<_>>(), [10, 11]);
+            assert_eq!(v[a], 12);
+            v[a] += 1;
+            assert_eq!(*v.get(a), 13);
+            assert!(v.check(1006).is_none());
+            assert_eq!(v.check(1005).map(|i| v[i]), Some(999));
+            assert_eq!(v.last_index().map(Index::get), Some(1005));
+            assert_eq!(
+                v.iter_indexed().nth(3).map(|(i, &x)| (i.get(), x)),
+                Some((3, 13))
+            );
+            assert_eq!(v.len(), 1006);
+        });
+        append_scope(|token| {
+            let v: AppendVec<'_, u8> = AppendVec::new(token);
+            assert!(v.is_empty() && v.last_index().is_none() && v.check(0).is_none());
+        });
+    }
+
+    #[test]
+    fn append_vec_compact_indices_and_freeze() {
+        let kept = append_scope(|token| {
+            let mut v = AppendVec::new(token);
+            let ids: Vec<Index<'_, u32>> = (0..5)
+                .map(|i| v.push(i * 2).to_repr::<u32>().unwrap())
+                .collect();
+            assert_eq!(v[ids[3]], 6);
+            let (len, data) = v.freeze();
+            let s = len.brand(&data).unwrap();
+            assert_eq!(ids.iter().map(|&i| s[i]).sum::<i32>(), 20);
+            ValidIndices::from_branded(len, ids)
+        });
+        assert_eq!(
+            (kept.as_slice(), kept.bound()),
+            (&[0u32, 1, 2, 3, 4][..], 5)
+        );
+    }
+
+    #[test]
+    fn append_vec_self_referential_graph() {
+        struct Node<'id> {
+            edges: Vec<Index<'id>>,
+        }
+        let reachable = append_scope(|token| {
+            let mut g = AppendVec::new(token);
+            let root = g.push(Node { edges: Vec::new() });
+            let mut prev = root;
+            for _ in 0..10 {
+                let n = g.push(Node {
+                    edges: alloc::vec![prev],
+                });
+                prev = n;
+            }
+            g[root].edges.push(prev); // cycle
+            let mut seen = alloc::vec![false; g.len()];
+            let mut stack = alloc::vec![root];
+            while let Some(n) = stack.pop() {
+                if !core::mem::replace(&mut seen[n.get()], true) {
+                    stack.extend(g[n].edges.iter().copied());
+                }
+            }
+            seen.iter().filter(|&&s| s).count()
+        });
+        assert_eq!(reachable, 11);
     }
 
     #[test]

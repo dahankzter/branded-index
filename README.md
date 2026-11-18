@@ -54,7 +54,36 @@ with another brand, or smuggled out of the closure.
 | `Grid<'id>` | row-major, `width * height == n` | `Len::grid` |
 | `ValidIndices<I>` | owned, every element `< bound`; no brand in its type | `ValidIndices::new`, `from_branded`; `view(len)` re-brands if `len >= bound` |
 | `ValidOffsets` | owned, non-decreasing, all `<= bound` | `ValidOffsets::new`; `view(len)` gives `Offsets<'id, '_>` |
+| `AppendVec<'id, T>` | only grows, so every index it hands out stays valid; elements may hold indices into the same vector | `append_scope` + `AppendVec::new(token)`; `push`, `extend`, `check`, `indices`; `freeze` returns the final `Len<'id>` |
 | `Interior<'id, R>` | at least `R` cells from every edge; `at::<DR, DC>()` reaches any neighbour with `\|DR\|, \|DC\| <= R`, bound checked at compile time | `Grid::interior_rows::<R>()` |
+
+Branded operations that need no extra check, or one cheap one:
+
+- `Index`: `prev`, `checked_sub` (no bound needed), `next(len)`, `checked_add(k, len)`.
+- `Range`: `split_at`, `split_first`, `split_last`, `contains`.
+- `Slice`: `binary_search` and `binary_search_by` return a branded `Index`; `partition_point`
+  returns the two branded `Range`s; `iter_indexed` / `iter_indexed_mut` pair elements with
+  their indices.
+
+### Graphs and arenas: `AppendVec`
+
+```rust
+use branded_index::{AppendVec, Index, append_scope};
+
+struct Node<'id> {
+    edges: Vec<Index<'id>>, // indices into the same vector
+}
+
+append_scope(|token| {
+    let mut g = AppendVec::new(token);
+    let a = g.push(Node { edges: vec![] });
+    let b = g.push(Node { edges: vec![a] });
+    g[a].edges.push(b); // cycles are fine; every access is check-free
+});
+```
+
+The vector never shrinks, so an index handed out once stays valid for the whole scope. The
+token is single-use: one vector per brand, and no `Len<'id>` until `freeze`.
 
 Indexing a `Slice<'id>` with an `Index<'id>` or `Range<'id>` compiles to a plain load. Mixing
 brands, or letting an index escape its scope, is a compile error. The `compile_fail` doctests in
@@ -193,8 +222,9 @@ the serial branded index loop. Short rows keep the exact serial result.
 
 - Branded values (`Index<'id>`, `Slice<'id>`) are closure-scoped. Persist validated data as
   `ValidIndices` / `ValidOffsets` (or your own type built from them) and re-brand per use.
-- Arbitrary index arithmetic (`i + k`) still needs a fresh check. Only fixed grid offsets
-  within the interior margin are free.
+- Index arithmetic going up (`i + k`) needs one comparison (`checked_add`); going down is
+  free (`checked_sub`). Fixed grid offsets within the interior margin are free.
+- `AppendVec` cannot remove elements; that is what keeps its indices valid.
 - A language feature (pattern types or refinement types) could make this ergonomic. This crate
   shows the codegen side is already solved.
 
