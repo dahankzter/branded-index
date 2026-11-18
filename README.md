@@ -119,8 +119,28 @@ give C. Results differ from the serial sum in the last bits (tested to within `1
   overlaps different rows, so independent chains add little. Memory-bound cases don't move.
 - **Wider is not better.** At `target-cpu=native`, K=8 compiles to AVX-512 `vgatherdpd`, and K=4
   packs scalar loads into `ymm` registers. Both cost more than they save on short rows (Zen 5).
-- **Rule of thumb:** K=4 for rows averaging around 64 or more nonzeros; serial otherwise. The cost
-  of indexing `x[col]` was never the issue here; the order of the additions was.
+- **The fixed-`K` choice is a trap under `target-cpu=native`**, which is exactly the flag people
+  reach for when they want speed.
+
+### Adaptive SpMV (`kernels::spmv::branded_adaptive`), the robust choice
+
+Per row: 4 running sums when the row has at least `ADAPTIVE_MIN_ROW` (32) nonzeros, otherwise
+the serial branded index loop. Short rows keep the exact serial result.
+
+| Matrix | build | unchecked | branded | K=4 | **adaptive** |
+|---|---|---|---|---|---|
+| 1K, 16 | default | 3.50 µs | 3.54 µs | 3.02 µs | 3.51 µs |
+| 64K, 16 | default | 318 µs | 320 µs | 316 µs | 320 µs |
+| 4K, 256 | default | 310 µs | 310 µs | 198 µs | **197 µs** |
+| 1K, 16 | native | 3.35 µs | 3.35 µs | 3.51 µs | 3.36 µs |
+| 64K, 16 | native | 321 µs | 317 µs | 332 µs | 318 µs |
+| 4K, 256 | native | 311 µs | 312 µs | 175 µs | **175 µs** |
+
+- Never slower than `unchecked` in either build, and 1.6–1.8x faster on long rows.
+- It gives up K=4's 14% on short rows in the default build, which is the price of never
+  regressing under `native`.
+- The serial path must be the branded index loop. A first version used `zip` there and was 20%
+  slower under `native` on short rows: the loop-shape effect again.
 
 ## Limits
 

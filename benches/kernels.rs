@@ -179,6 +179,9 @@ fn bench_spmv_reassoc(c: &mut Criterion) {
                 g.bench_function("reassoc K=4", |bn| {
                     bn.iter(|| spmv::branded_reassoc::<4>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
                 });
+                g.bench_function("adaptive", |bn| {
+                    bn.iter(|| spmv::branded_adaptive(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
+                });
                 g.bench_function("reassoc K=8", |bn| {
                     bn.iter(|| spmv::branded_reassoc::<8>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
                 });

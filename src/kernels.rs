@@ -247,6 +247,54 @@ pub mod spmv {
             *y = s;
         }
     }
+
+    /// Rows at least this long use [`branded_adaptive`]'s 4-way reassociated path.
+    pub const ADAPTIVE_MIN_ROW: usize = 32;
+
+    /// Picks per row: 4 accumulators for long rows, the serial loop for short ones. Short rows
+    /// gain nothing from extra chains (the CPU already overlaps rows), and wider `K` regresses
+    /// at `target-cpu=native` through AVX-512 gathers. Reassociates long rows only.
+    #[inline(never)]
+    pub fn branded_adaptive<'z, 'c>(
+        rows: Offsets<'z, '_>,
+        cols: Slice<'z, '_, Index<'c, u32>>,
+        vals: Slice<'z, '_, f64>,
+        x: Slice<'c, '_, f64>,
+        y: &mut [f64],
+    ) {
+        for (y, r) in y.iter_mut().zip(rows.ranges()) {
+            *y = if r.len() >= ADAPTIVE_MIN_ROW {
+                dot_reassoc::<4, _>(&vals[r.clone()], &cols[r], x)
+            } else {
+                // Same loop shape as `branded`: a branded index loop, not `zip`.
+                let mut s = 0.0;
+                for k in r {
+                    s += vals[k] * x[cols[k]];
+                }
+                s
+            };
+        }
+    }
+
+    #[inline(always)]
+    fn dot_reassoc<'c, const K: usize, X>(v: &[f64], c: &[Index<'c, u32>], x: X) -> f64
+    where
+        X: core::ops::Index<Index<'c, u32>, Output = f64>,
+    {
+        let (v_chunks, v_rest) = v.as_chunks::<K>();
+        let (c_chunks, c_rest) = c.as_chunks::<K>();
+        let mut acc = [0.0f64; K];
+        for (vk, ck) in v_chunks.iter().zip(c_chunks) {
+            for j in 0..K {
+                acc[j] += vk[j] * x[ck[j]];
+            }
+        }
+        let mut s = acc.iter().sum::<f64>();
+        for (v, &c) in v_rest.iter().zip(c_rest) {
+            s += v * x[c];
+        }
+        s
+    }
 }
 
 /// Union-find with path halving. The parent array stores indices into itself, so the data
@@ -508,11 +556,12 @@ mod tests {
 
     #[test]
     fn spmv_reassoc_matches_within_rounding() {
-        // Row lengths 0..=19 cover full chunks, remainders and empty rows.
-        let mut a = spmv::Csr::random(40, 50, 19, 8);
+        // Row lengths 0..=39 cover empty rows, remainders, and rows on both sides of the
+        // adaptive threshold.
+        let mut a = spmv::Csr::random(40, 50, 39, 8);
         let mut row_ptr = vec![0];
         for r in 0..a.nrows {
-            row_ptr.push(row_ptr[r] + r % 20);
+            row_ptr.push(row_ptr[r] + r);
         }
         let nnz = *row_ptr.last().unwrap();
         a.cols.truncate(nnz);
@@ -539,7 +588,25 @@ mod tests {
             });
             got
         }
-        for got in [run::<1>(&a, &x), run::<2>(&a, &x), run::<4>(&a, &x), run::<8>(&a, &x)] {
+        let mut adaptive = vec![0.0; a.nrows];
+        with_len(a.vals.len(), |z| {
+            with_len(a.ncols, |c| {
+                let m = spmv::validate(z, c, &a).unwrap();
+                spmv::branded_adaptive(
+                    m.rows,
+                    z.brand(&m.cols).unwrap(),
+                    z.brand(&a.vals).unwrap(),
+                    c.brand(&x).unwrap(),
+                    &mut adaptive,
+                );
+            })
+        });
+        for (r, (g, w)) in adaptive.iter().zip(&want).enumerate() {
+            if a.row_ptr[r + 1] - a.row_ptr[r] < spmv::ADAPTIVE_MIN_ROW {
+                assert_eq!(g, w, "short rows keep the serial order");
+            }
+        }
+        for got in [run::<1>(&a, &x), run::<2>(&a, &x), run::<4>(&a, &x), run::<8>(&a, &x), adaptive] {
             for (g, w) in got.iter().zip(&want) {
                 assert!((g - w).abs() <= 1e-12 * w.abs().max(1.0), "{g} vs {w}");
             }

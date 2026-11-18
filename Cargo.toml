@@ -1,6 +1,6 @@
 [package]
 name = "branded-index"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "Branded indices: pay the bounds check once, at validation, instead of on every access"
 license = "MIT OR Apache-2.0"
