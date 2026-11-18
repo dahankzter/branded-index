@@ -98,6 +98,30 @@ change. `unchecked` and `branded` stayed stable.
    The `large` native row is DRAM-bound and favours the checked/idiomatic loop shapes, probably
    through prefetch behaviour. It shows the same "layout over checks" theme.
 
+### Reassociated SpMV (opt-in, `kernels::spmv::branded_reassoc::<K>`)
+
+Each row's sum is split into `K` independent running sums, so the additions run as `K` parallel
+chains instead of one serial chain. This is safe, stable Rust, and gets what `-ffast-math` would
+give C. Results differ from the serial sum in the last bits (tested to within `1e-12` relative).
+
+| Matrix (rows = cols, nonzeros/row) | build | unchecked | branded | K=2 | K=4 | K=8 |
+|---|---|---|---|---|---|---|
+| 1K, 16 | default | 3.49 µs | 3.55 µs | 3.47 µs | **3.03 µs** | 3.35 µs |
+| 64K, 16 | default | 319 µs | 320 µs | 321 µs | 318 µs | 330 µs |
+| 4K, 256 | default | 309 µs | 309 µs | 204 µs | 196 µs | **194 µs** |
+| 1K, 16 | native | 3.36 µs | 3.36 µs | 3.48 µs | 3.52 µs | 5.46 µs |
+| 64K, 16 | native | 326 µs | 324 µs | 345 µs | 348 µs | 485 µs |
+| 4K, 256 | native | 311 µs | 311 µs | 190 µs | **172 µs** | 305 µs |
+
+- **Long rows: 1.6–1.8x faster than `unchecked`.** The serial addition chain was the bottleneck,
+  and safe reassociation beats the hand-written `unsafe` loop.
+- **Short rows: little or no gain, sometimes a loss.** With 16 nonzeros per row the CPU already
+  overlaps different rows, so independent chains add little. Memory-bound cases don't move.
+- **Wider is not better.** At `target-cpu=native`, K=8 compiles to AVX-512 `vgatherdpd`, and K=4
+  packs scalar loads into `ymm` registers. Both cost more than they save on short rows (Zen 5).
+- **Rule of thumb:** K=4 for rows averaging around 64 or more nonzeros; serial otherwise. The cost
+  of indexing `x[col]` was never the issue here; the order of the additions was.
+
 ## Limits
 
 - Brands are closure-scoped, so validated structures cannot be stored in a long-lived struct

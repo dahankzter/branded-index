@@ -218,6 +218,35 @@ pub mod spmv {
             *y = s;
         }
     }
+
+    /// Like [`branded`], but each row's dot product uses `K` independent accumulators, so the
+    /// additions form `K` parallel chains instead of one serial chain. This reassociates the
+    /// floating-point sum: results differ from the other variants in the last bits.
+    #[inline(never)]
+    pub fn branded_reassoc<'z, 'c, const K: usize>(
+        rows: Offsets<'z, '_>,
+        cols: Slice<'z, '_, Index<'c, u32>>,
+        vals: Slice<'z, '_, f64>,
+        x: Slice<'c, '_, f64>,
+        y: &mut [f64],
+    ) {
+        for (y, r) in y.iter_mut().zip(rows.ranges()) {
+            let (v, c) = (&vals[r.clone()], &cols[r]);
+            let (v_chunks, v_rest) = v.as_chunks::<K>();
+            let (c_chunks, c_rest) = c.as_chunks::<K>();
+            let mut acc = [0.0f64; K];
+            for (vk, ck) in v_chunks.iter().zip(c_chunks) {
+                for j in 0..K {
+                    acc[j] += vk[j] * x[ck[j]];
+                }
+            }
+            let mut s = acc.iter().sum::<f64>();
+            for (v, &c) in v_rest.iter().zip(c_rest) {
+                s += v * x[c];
+            }
+            *y = s;
+        }
+    }
 }
 
 /// Union-find with path halving. The parent array stores indices into itself, so the data
@@ -475,6 +504,47 @@ mod tests {
                 assert_eq!(got, want);
             })
         });
+    }
+
+    #[test]
+    fn spmv_reassoc_matches_within_rounding() {
+        // Row lengths 0..=19 cover full chunks, remainders and empty rows.
+        let mut a = spmv::Csr::random(40, 50, 19, 8);
+        let mut row_ptr = vec![0];
+        for r in 0..a.nrows {
+            row_ptr.push(row_ptr[r] + r % 20);
+        }
+        let nnz = *row_ptr.last().unwrap();
+        a.cols.truncate(nnz);
+        a.vals.truncate(nnz);
+        a.row_ptr = row_ptr;
+
+        let x: Vec<f64> = (0..a.ncols).map(|i| 1.0 + i as f64 / 7.0).collect();
+        let mut want = vec![0.0; a.nrows];
+        spmv::checked(&a, &x, &mut want);
+
+        fn run<const K: usize>(a: &spmv::Csr, x: &[f64]) -> Vec<f64> {
+            let mut got = vec![0.0; a.nrows];
+            with_len(a.vals.len(), |z| {
+                with_len(a.ncols, |c| {
+                    let m = spmv::validate(z, c, a).unwrap();
+                    spmv::branded_reassoc::<K>(
+                        m.rows,
+                        z.brand(&m.cols).unwrap(),
+                        z.brand(&a.vals).unwrap(),
+                        c.brand(x).unwrap(),
+                        &mut got,
+                    );
+                })
+            });
+            got
+        }
+        for got in [run::<1>(&a, &x), run::<2>(&a, &x), run::<4>(&a, &x), run::<8>(&a, &x)] {
+            for (g, w) in got.iter().zip(&want) {
+                assert!((g - w).abs() <= 1e-12 * w.abs().max(1.0), "{g} vs {w}");
+            }
+        }
+        assert_eq!(run::<1>(&a, &x), want, "K = 1 is the serial order");
     }
 
     #[test]

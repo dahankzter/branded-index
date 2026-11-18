@@ -153,6 +153,41 @@ fn bench_stencil(c: &mut Criterion) {
     }
 }
 
+fn bench_spmv_reassoc(c: &mut Criterion) {
+    // (label, rows = cols, nonzeros per row)
+    for (label, n, per_row) in [("small-16", 1 << 10, 16), ("large-16", 1 << 16, 16), ("wide-256", 1 << 12, 256)] {
+        let a = spmv::Csr::random(n, n, per_row, 3);
+        let x: Vec<f64> = (0..n).map(|i| i as f64 / n as f64).collect();
+        let mut y = vec![0.0f64; n];
+
+        let mut g = c.benchmark_group(format!("spmv_reassoc/{label}"));
+        g.throughput(Throughput::Elements(a.vals.len() as u64));
+        g.bench_function("unchecked", |bn| {
+            // SAFETY: `Csr::random` builds a well-formed matrix and `x.len() == ncols`.
+            bn.iter(|| unsafe { spmv::unchecked(black_box(&a), black_box(&x), &mut y) })
+        });
+        with_len(a.vals.len(), |z| {
+            with_len(a.ncols, |cl| {
+                let m = spmv::validate(z, cl, &a).unwrap();
+                let (cols, vals, xb) = (z.brand(&m.cols).unwrap(), z.brand(&a.vals).unwrap(), cl.brand(&x).unwrap());
+                g.bench_function("branded", |bn| {
+                    bn.iter(|| spmv::branded(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
+                });
+                g.bench_function("reassoc K=2", |bn| {
+                    bn.iter(|| spmv::branded_reassoc::<2>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
+                });
+                g.bench_function("reassoc K=4", |bn| {
+                    bn.iter(|| spmv::branded_reassoc::<4>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
+                });
+                g.bench_function("reassoc K=8", |bn| {
+                    bn.iter(|| spmv::branded_reassoc::<8>(black_box(m.rows), black_box(cols), black_box(vals), black_box(xb), &mut y))
+                });
+            })
+        });
+        g.finish();
+    }
+}
+
 fn config() -> Criterion {
     Criterion::default()
         .warm_up_time(Duration::from_millis(500))
@@ -163,6 +198,6 @@ fn config() -> Criterion {
 criterion_group! {
     name = benches;
     config = config();
-    targets = bench_add, bench_gather, bench_spmv, bench_union_find, bench_stencil
+    targets = bench_add, bench_gather, bench_spmv, bench_union_find, bench_stencil, bench_spmv_reassoc
 }
 criterion_main!(benches);
